@@ -336,7 +336,7 @@ end
 # scanned: the worker that finishes their last dep chunk runs them itself.
 #
 # Each BuiltGraphNode owns the runtime counters of its children in one
-# AtomicMemory{Int}: a done counter for the graph, then a ready counter and a
+# AtomicMemory{Int64}: a done counter for the graph, then a ready counter and a
 # claim counter per child, at a stride of one cache line so children don't
 # false-share. The first stride is left empty
 # so the done counter doesn't share a line with the memory's header, whose
@@ -346,7 +346,7 @@ end
 #
 # The line is 64 bytes on most targets but 128 on Apple silicon
 const CACHE_LINE = 128
-const JOB_STATE_STRIDE = CACHE_LINE ÷ sizeof(Int)
+const JOB_STATE_STRIDE = CACHE_LINE ÷ sizeof(Int64)
 
 # done_ctr: unfinished chunks of the graph's end children, those nothing depend
 # on. The worker that takes it to 0 is elected to run repeat_if, then either
@@ -384,17 +384,17 @@ _ready_idx(i::Int) = (i + 1) * JOB_STATE_STRIDE + 1
 # worker readies the child then. Graphs are elected by a swap, so no bump
 # ever lands on an active graph's 0.
 _claim_idx(i::Int) = (i + 1) * JOB_STATE_STRIDE + 2
-const CLAIM_READY = 2^61 # > any nchunks plus any overshoot
+const CLAIM_READY = Int64(2)^61 # > any nchunks plus any overshoot
 const CLAIM_READYING = CLAIM_READY + 1
-const CLAIM_NOT_READY = 2^62 # > CLAIM_READYING plus any stale bumps
+const CLAIM_NOT_READY = Int64(2)^62 # > CLAIM_READYING plus any stale bumps
 
 # One graph of a BuiltJobGraph.
 mutable struct BuiltGraphNode
     const labels::Vector{Symbol} # per child
     const children::Vector{Union{BuiltGraphNode, Job}}
     const rev_deps::Vector{Vector{Int}} # per child: the later siblings that dep on it, increasing
-    const total_dep_chunks::Vector{Int} # per child: chunks of its deps, the initial ready_ctr
-    const total_end_chunks::Int # chunks of the end children, the initial done_ctr
+    const total_dep_chunks::Vector{Int64} # per child: chunks of its deps, the initial ready_ctr
+    const total_end_chunks::Int64 # chunks of the end children, the initial done_ctr
     # per child: nothing, or the skip_chunks function, a do_if wrapped in DoIfSkip
     const skip_chunks::Vector{Any}
     const repeat_if::Any # nothing, or the repeat_if predicate
@@ -403,7 +403,7 @@ mutable struct BuiltGraphNode
     # Each child has at most one on_fin rev dep.
     const on_fin::Vector{Bool}
     const scan::Vector{Int} # the children scanning workers look at: those not on_fin
-    const states::AtomicMemory{Int} # JOB_STATE_STRIDE*(length(children)+2) Ints, see _done_idx, _ready_idx and _claim_idx
+    const states::AtomicMemory{Int64} # JOB_STATE_STRIDE*(length(children)+2) Int64s, see _done_idx, _ready_idx and _claim_idx
 end
 
 function Base.show(io::IO, node::BuiltGraphNode)
@@ -419,13 +419,13 @@ function _build(g::JobGraph, nworkers::Int)
         # empty nested graphs having been pruned, and run! does nothing for it.
         return BuiltGraphNode(
             copy(g.labels), Union{BuiltGraphNode, Job}[s isa Job ? s : _build(s, nworkers) for s in g.jobs],
-            Vector{Int}[], Int[], 0, copy(g.skip_chunks), g.repeat_if,
-            Bool[], Int[], AtomicMemory{Int}(undef, 0),
+            Vector{Int}[], Int64[], Int64(0), copy(g.skip_chunks), g.repeat_if,
+            Bool[], Int[], AtomicMemory{Int64}(undef, 0),
         )
     end
     nchunks = [s isa Job ? s.nchunks : 1 for s in g.jobs]
     rev_deps = [Int[] for _ in 1:n]
-    total_dep_chunks = zeros(Int, n)
+    total_dep_chunks = zeros(Int64, n)
     for i in 1:n
         for d in g.deps[i]
             push!(rev_deps[d], i) # i increases, so each rev_deps is increasing
@@ -433,7 +433,7 @@ function _build(g::JobGraph, nworkers::Int)
         end
     end
     # the last child has no rev deps, so this is not empty
-    total_end_chunks = 0
+    total_end_chunks = Int64(0)
     for i in 1:n
         if isempty(rev_deps[i])
             total_end_chunks += nchunks[i]
@@ -454,7 +454,7 @@ function _build(g::JobGraph, nworkers::Int)
             end
         end
     end
-    states = AtomicMemory{Int}(undef, JOB_STATE_STRIDE * (n + 2))
+    states = AtomicMemory{Int64}(undef, JOB_STATE_STRIDE * (n + 2))
     for i in eachindex(states)
         @atomic :monotonic states[i] = CLAIM_NOT_READY # nothing to do until activated
     end
@@ -859,7 +859,7 @@ function _scan!(g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode)
                 progress = true
                 # elected to ready child i: skip it, or activate it and scan it
                 if _call_skip_chunks(w, node, i) > 0 # skip the one chunk a graph is: finish it at once, as if it had run
-                    @inbounds @atomic :monotonic states[_claim_idx(i)] = 1 # exhausted
+                    @inbounds @atomic :monotonic states[_claim_idx(i)] = Int64(1) # exhausted
                     done = _finish!(g, w, node, i, 1)
                     done && return (progress=true, done=true)
                     continue
@@ -871,7 +871,7 @@ function _scan!(g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode)
                 # before this line. A store of 0 would then mark a done graph
                 # active.
                 # Release pairs with the acquire above.
-                @inbounds @atomicreplace :release :monotonic states[_claim_idx(i)] CLAIM_READYING => 0 # active
+                @inbounds @atomicreplace :release :monotonic states[_claim_idx(i)] CLAIM_READYING => Int64(0) # active
                 # Only now can other workers descend into child. This worker
                 # takes one of the published chunks below.
                 npublished > 1 && _wake_sleeping!(g)
@@ -879,7 +879,7 @@ function _scan!(g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode)
             scanned = _scan!(g, w, child)
             progress |= scanned.progress
             if scanned.done # finish it here, as child i
-                @inbounds @atomic :monotonic states[_claim_idx(i)] = 1 # scanners stop descending
+                @inbounds @atomic :monotonic states[_claim_idx(i)] = Int64(1) # scanners stop descending
                 done = _finish!(g, w, node, i, 1)
                 done && return (progress=true, done=true)
             end
@@ -904,7 +904,7 @@ function _claim!(fun, g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode, i:
         # The acquire pairs with the release store of CLAIM_READY or the skip
         # count by the worker that readied the job,
         # so the dep chunks' writes are visible before skip_chunks or fun runs.
-        chunk_idx = @inbounds @atomic :acquire states[_claim_idx(i)] += 1
+        chunk_idx = @inbounds @atomic :acquire states[_claim_idx(i)] += Int64(1)
         if chunk_idx == CLAIM_READYING # it was CLAIM_READY: elected to ready it
             skip = min(_call_skip_chunks(w, node, i), nchunks)
             if skip == nchunks
@@ -916,8 +916,8 @@ function _claim!(fun, g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode, i:
             # This worker takes one chunk below.
             nchunks - skip > 1 && _wake_sleeping!(g)
         elseif chunk_idx ≤ nchunks
-            w.at = (node, i, chunk_idx)
-            fun(chunk_idx, w.info)
+            w.at = (node, i, Int(chunk_idx))
+            fun(Int(chunk_idx), w.info)
             ndone += 1
         else
             break # exhausted
@@ -954,7 +954,7 @@ function _publish!(node::BuiltGraphNode, i::Int)::Int
     states = node.states
     child = node.children[i]
     if child isa Job && isnothing(node.skip_chunks[i])
-        @inbounds @atomic :release states[_claim_idx(i)] = 0 # claimable
+        @inbounds @atomic :release states[_claim_idx(i)] = Int64(0) # claimable
         child.nchunks
     else
         @inbounds @atomic :release states[_claim_idx(i)] = CLAIM_READY
