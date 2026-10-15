@@ -1,5 +1,7 @@
 module ParallelPlans
 
+export Job, JobGraph, plan, run!
+
 # A system for efficient multithreaded programs with mostly static schedules
 
 #=
