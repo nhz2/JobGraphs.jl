@@ -177,6 +177,5 @@ JobGraphs was inspired by:
 - [Taskflow](https://github.com/taskflow/taskflow)
 - [CUDA Graphs](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html)
 
-## License
-
-MIT, see [LICENSE](LICENSE).
+This package was developed with assistance from
+Claude Code.
