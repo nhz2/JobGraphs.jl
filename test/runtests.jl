@@ -5,14 +5,14 @@ using Aqua: Aqua
 
 Aqua.test_all(ParallelPlans)
 
-# Stage funs and predicates the construction and plan tests never call.
-stage_fun_a(chunk_idx, info) = nothing
-stage_fun_b(chunk_idx, info) = nothing
+# Job funs and predicates the construction and plan tests never call.
+job_fun_a(chunk_idx, info) = nothing
+job_fun_b(chunk_idx, info) = nothing
 pred_a(info) = true
 pred_b(info) = false
 skip_a(info) = 1
 
-# Recording runs. A stage fun records each chunk it runs with ticks of a
+# Recording runs. A job fun records each chunk it runs with ticks of a
 # shared clock taken before and after its work, so intervals compare across
 # workers, and a predicate counts its calls.
 
@@ -48,7 +48,7 @@ function check_info(ctx::RunCtx, info)
     nothing
 end
 
-# A stage fun that records its chunks as `id`.
+# A job fun that records its chunks as `id`.
 struct RunFun
     ctx::RunCtx
     id::Symbol
@@ -68,7 +68,7 @@ function (f::RunFun)(chunk_idx, info)
     x
 end
 
-# A stage fun that sleeps `secs` then records its chunk as `f` does, so
+# A job fun that sleeps `secs` then records its chunk as `f` does, so
 # the other workers run out of spins and sleep meanwhile.
 struct SlowFun
     f::RunFun
@@ -124,13 +124,13 @@ end
 
 # Run plan b on a reset ctx and return the (id, chunk) pairs recorded, sorted,
 # checking no worker overlapped its own chunks.
-function run_chunks(ctx::RunCtx, b::ParallelPlans.BuiltStageGraph)
+function run_chunks(ctx::RunCtx, b::ParallelPlans.BuiltJobGraph)
     run_reset!(ctx, b.nworkers)
     @test isnothing(ParallelPlans.run!(b))
     @test workers_serial(ctx.events)
     sort!([(e.id, e.chunk) for e in ctx.events])
 end
-run_chunks(ctx::RunCtx, g::ParallelPlans.StageGraph, nw::Int) = run_chunks(ctx, ParallelPlans.plan(g, nw))
+run_chunks(ctx::RunCtx, g::ParallelPlans.JobGraph, nw::Int) = run_chunks(ctx, ParallelPlans.plan(g, nw))
 
 # The ids of the last run's chunks in start order.
 run_order(ctx::RunCtx) = [e.id for e in sort(ctx.events; by=e -> e.t0)]
@@ -142,7 +142,7 @@ function run_before(ctx::RunCtx, before::Vector{Symbol}, after::Vector{Symbol})
 end
 
 # The exception run! throws for plan b, or nothing. Resets ctx.
-function run_error(ctx::RunCtx, b::ParallelPlans.BuiltStageGraph)
+function run_error(ctx::RunCtx, b::ParallelPlans.BuiltJobGraph)
     run_reset!(ctx, b.nworkers)
     try
         ParallelPlans.run!(b)
@@ -151,20 +151,20 @@ function run_error(ctx::RunCtx, b::ParallelPlans.BuiltStageGraph)
         e
     end
 end
-run_error(ctx::RunCtx, g::ParallelPlans.StageGraph, nw::Int) = run_error(ctx, ParallelPlans.plan(g, nw))
+run_error(ctx::RunCtx, g::ParallelPlans.JobGraph, nw::Int) = run_error(ctx, ParallelPlans.plan(g, nw))
 
-# Where a parallel run's error says each worker was, like "in stage a chunk 1".
+# Where a parallel run's error says each worker was, like "in job a chunk 1".
 # Through the same function as showerror, which is not called on real errors
 # here as printing backtraces is slow to compile.
-error_wheres(e::ParallelPlans.StageGraphError) = [ParallelPlans._where_string(we.label, we.chunk_idx) for we in e.worker_errors]
+error_wheres(e::ParallelPlans.JobGraphError) = [ParallelPlans._where_string(we.label, we.chunk_idx) for we in e.worker_errors]
 
 # A predicate of g throws: the error is attributed to it, serially and on NW workers.
-function check_pred_error(ctx::RunCtx, g::ParallelPlans.StageGraph, where::String, NW::Int)
+function check_pred_error(ctx::RunCtx, g::ParallelPlans.JobGraph, where::String, NW::Int)
     e = run_error(ctx, g, 1)
     @test e isa ErrorException
     @test occursin(where, e.msg)
     e = run_error(ctx, g, NW)
-    @test e isa ParallelPlans.StageGraphError
+    @test e isa ParallelPlans.JobGraphError
     @test error_wheres(e) == [where]
 end
 
@@ -179,7 +179,7 @@ function check_serial_plan(node::ParallelPlans.BuiltGraphNode, ref::ParallelPlan
     @test isempty(node.on_fin) && isempty(node.scan) && isempty(node.states)
     @test length(node.children) == length(ref.children)
     for (c, r) in zip(node.children, ref.children)
-        if c isa ParallelPlans.Stage
+        if c isa ParallelPlans.Job
             @test c === r
         else
             @test r isa ParallelPlans.BuiltGraphNode
@@ -216,7 +216,7 @@ end
 struct XInfo
     deps::Vector{Vector{Int}} # sibling ids, through pruned empty siblings
     ancestors::Vector{Vector{Int}} # graph ids from the root down to the parent
-    nrepeat::Vector{Int} # graphs: iterations per activation; stages: 1
+    nrepeat::Vector{Int} # graphs: iterations per activation; jobs: 1
 end
 
 function x_reset!(ctx::XCtx, nworkers::Int)
@@ -295,7 +295,7 @@ end
 
 # The declaration of graph `id`, registered already, nested at most `depth`
 # deep with 0:5 nodes per level (1:5 at the root), random deps between
-# siblings, random predicates and 1:3 iterations per activation. Stages have
+# siblings, random predicates and 1:3 iterations per activation. Jobs have
 # 0:4 chunks, so some nodes are empty and pruned: a dep on one is recorded as
 # deps on its deps.
 function x_rand_graph!(rng, ctx::XCtx, info::XInfo, id::Int, ancestors::Vector{Int}, depth::Int)
@@ -315,27 +315,27 @@ function x_rand_graph!(rng, ctx::XCtx, info::XInfo, id::Int, ancestors::Vector{I
                 push!(info.deps[cid], cids[j])
             end
         end
-        stage = if depth > 0 && rand(rng) < 0.3
+        job = if depth > 0 && rand(rng) < 0.3
             x_rand_graph!(rng, ctx, info, cid, anc, depth - 1)
         else
-            ParallelPlans.Stage(XFun(ctx, cid, anc), rand(rng, 0:4))
+            ParallelPlans.Job(XFun(ctx, cid, anc), rand(rng, 0:4))
         end
         kind = rand(rng, 0:4)
         props = if iszero(kind)
-            (; stage, deps)
+            (; job, deps)
         elseif kind == 4
-            (; skip_chunks=XSkipChunks(ctx, cid), stage, deps)
+            (; skip_chunks=XSkipChunks(ctx, cid), job, deps)
         else
-            (; do_if=XDoIf(ctx, cid, kind), stage, deps)
+            (; do_if=XDoIf(ctx, cid, kind), job, deps)
         end
         push!(nodes, Symbol(:n, i) => props)
         push!(cids, cid)
-        push!(empties, ParallelPlans._is_stage_empty(stage))
+        push!(empties, ParallelPlans._is_job_empty(job))
     end
     nrepeat = rand(rng, 1:3)
     info.nrepeat[id] = nrepeat
     repeat_if = isone(nrepeat) && rand(rng, Bool) ? nothing : XRepeatIf(ctx, id, nrepeat)
-    ParallelPlans.StageGraph(nodes; repeat_if)
+    ParallelPlans.JobGraph(nodes; repeat_if)
 end
 
 # A random root graph with its ctx and info.
@@ -411,32 +411,32 @@ function check_random_runs(rng, ntrials::Int, NW::Int)
     end
 end
 
-@testset "Stage graph" begin
-    Stage = ParallelPlans.Stage
-    StageGraph = ParallelPlans.StageGraph
+@testset "Job graph" begin
+    Job = ParallelPlans.Job
+    JobGraph = ParallelPlans.JobGraph
     plan = ParallelPlans.plan
     run! = ParallelPlans.run!
     NW = 4
 
     @testset "construction" begin
-        s = Stage(stage_fun_a, 10)
-        @test s.fun === stage_fun_a
+        s = Job(job_fun_a, 10)
+        @test s.fun === job_fun_a
         @test s.nchunks == 10
-        @test Stage(stage_fun_a, 2^30 - 1).nchunks == 2^30 - 1
-        @test Stage(stage_fun_a, 0).nchunks == 0
-        @test_throws ArgumentError Stage(stage_fun_a, -1)
-        @test_throws ArgumentError Stage(stage_fun_a, 2^30)
+        @test Job(job_fun_a, 2^30 - 1).nchunks == 2^30 - 1
+        @test Job(job_fun_a, 0).nchunks == 0
+        @test_throws ArgumentError Job(job_fun_a, -1)
+        @test_throws ArgumentError Job(job_fun_a, 2^30)
 
-        inner = StageGraph([:x => (;stage=Stage(stage_fun_b, 1))])
-        g = StageGraph([
-            :a => (;stage=s),
-            :b => (;do_if=pred_a, stage=Stage(stage_fun_b, 2), deps=()),
-            :c => (;stage=inner, deps=[:b, :a]),
-            :d => (;skip_chunks=skip_a, stage=inner),
+        inner = JobGraph([:x => (;job=Job(job_fun_b, 1))])
+        g = JobGraph([
+            :a => (;job=s),
+            :b => (;do_if=pred_a, job=Job(job_fun_b, 2), deps=()),
+            :c => (;job=inner, deps=[:b, :a]),
+            :d => (;skip_chunks=skip_a, job=inner),
         ]; repeat_if=pred_b)
         @test g.labels == [:a, :b, :c, :d]
-        @test g.stages[1] === s
-        @test g.stages[3] === g.stages[4] === inner # a graph can be reused
+        @test g.jobs[1] === s
+        @test g.jobs[3] === g.jobs[4] === inner # a graph can be reused
         @test g.deps == [[], [], [2, 1], []] # indices of earlier nodes, decreasing
         # a do_if is normalized to a wrapped skip_chunks
         @test g.skip_chunks == [nothing, ParallelPlans.DoIfSkip(pred_a), nothing, skip_a]
@@ -444,47 +444,47 @@ end
         @test isnothing(inner.repeat_if)
 
         # deps implied by another dep, and duplicates, are dropped
-        S = Stage(stage_fun_a, 1)
-        @test StageGraph([
-            :a => (;stage=S),
-            :b => (;stage=S, deps=[:a]),
-            :c => (;stage=S, deps=[:a, :b, :a]),
-            :d => (;stage=S, deps=[:a]),
-            :e => (;stage=S, deps=[:d, :c]), # both sides of the diamond are kept
+        S = Job(job_fun_a, 1)
+        @test JobGraph([
+            :a => (;job=S),
+            :b => (;job=S, deps=[:a]),
+            :c => (;job=S, deps=[:a, :b, :a]),
+            :d => (;job=S, deps=[:a]),
+            :e => (;job=S, deps=[:d, :c]), # both sides of the diamond are kept
         ]).deps == [[], [1], [2], [1], [4, 3]]
         # a lone Symbol is one dep
-        @test StageGraph([:a => (;stage=S), :b => (;stage=S, deps=:a)]).deps == [[], [1]]
+        @test JobGraph([:a => (;job=S), :b => (;job=S, deps=:a)]).deps == [[], [1]]
     end
 
     @testset "empty nodes are pruned" begin
-        S = Stage(stage_fun_a, 1)
-        S0 = Stage(stage_fun_b, 0)
-        G0 = StageGraph([])
+        S = Job(job_fun_a, 1)
+        S0 = Job(job_fun_b, 0)
+        G0 = JobGraph([])
         @test isempty(G0.labels)
-        @test isnothing(StageGraph([]; repeat_if=pred_a).repeat_if) # never run, so dropped
+        @test isnothing(JobGraph([]; repeat_if=pred_a).repeat_if) # never run, so dropped
         # a graph of only empty nodes is empty, so pruned in turn, and its
         # repeat_if is dropped the same way
-        emptied = StageGraph([:a => (;stage=S0), :b => (;stage=G0, deps=[:a])]; repeat_if=pred_a)
+        emptied = JobGraph([:a => (;job=S0), :b => (;job=G0, deps=[:a])]; repeat_if=pred_a)
         @test isempty(emptied.labels)
         @test isnothing(emptied.repeat_if)
         @test repr(emptied) == repr(G0) # so an emptied graph prints as the empty one
         # a dep on a pruned node becomes deps on what it depped on, transitively
-        g = StageGraph([
-            :a => (;stage=S),
-            :b => (;stage=S),
-            :c => (;do_if=pred_a, stage=S0, deps=[:a]),
-            :d => (;stage=G0, deps=[:c, :b]),
-            :e => (;stage=S, deps=[:d]),
-            :f => (;stage=S, deps=[:c]),
-            :g => (;stage=S, deps=[:d, :f]), # :a through :d is implied by :f
-            :h => (;stage=S0),
-            :i => (;stage=S, deps=[:h]),
+        g = JobGraph([
+            :a => (;job=S),
+            :b => (;job=S),
+            :c => (;do_if=pred_a, job=S0, deps=[:a]),
+            :d => (;job=G0, deps=[:c, :b]),
+            :e => (;job=S, deps=[:d]),
+            :f => (;job=S, deps=[:c]),
+            :g => (;job=S, deps=[:d, :f]), # :a through :d is implied by :f
+            :h => (;job=S0),
+            :i => (;job=S, deps=[:h]),
         ])
         @test g.labels == [:a, :b, :e, :f, :g, :i]
         @test g.deps == [[], [], [2, 1], [1], [4, 2], []]
         @test g.skip_chunks == fill(nothing, 6)
         # a pruned label is still taken
-        @test_throws ArgumentError StageGraph(Any[:a => (;stage=S0), :a => (;stage=S)])
+        @test_throws ArgumentError JobGraph(Any[:a => (;job=S0), :a => (;job=S)])
         # pruned nodes aren't printed, and the deps through them are
         @test !occursin(":c", repr(g))
         @test occursin("deps=[:b, :a]", repr(g))
@@ -493,87 +493,87 @@ end
     @testset "argument errors" begin
         # Any[...] as the constructor compiles once per element type of the
         # node vector, and each of these has its own
-        S = Stage(stage_fun_a, 1)
-        @test_throws ArgumentError StageGraph([]; repeat_if=false) # checked though never run
-        @test_throws ArgumentError StageGraph(Any[S]) # not a pair
-        @test_throws ArgumentError StageGraph(Any["a" => (;stage=S)]) # label not a Symbol
-        @test_throws ArgumentError StageGraph(Any[:a => S]) # not a NamedTuple
-        @test_throws ArgumentError StageGraph(Any[:a => (;nchunks=1)]) # no stage
-        @test_throws ArgumentError StageGraph(Any[:a => (;stage=S, chunks=1)]) # unknown property
-        @test_throws ArgumentError StageGraph(Any[:a => (;stage=stage_fun_a)]) # not a Stage
-        @test_throws ArgumentError StageGraph(Any[:a => (;do_if=true, stage=S)]) # a Bool is not a predicate
-        @test_throws ArgumentError StageGraph(Any[:a => (;skip_chunks=1, stage=S)]) # a number is not a skip_chunks
-        @test_throws ArgumentError StageGraph(Any[:a => (;do_if=pred_a, skip_chunks=skip_a, stage=S)]) # not both
-        @test_throws ArgumentError StageGraph(Any[:a => (;stage=S)]; repeat_if=false)
-        @test_throws ArgumentError StageGraph(Any[:a => (;stage=S), :a => (;stage=S)]) # duplicate label
-        @test_throws ArgumentError StageGraph(Any[:a => (;stage=S), :b => (;stage=S, deps=[1])]) # dep not a Symbol
-        @test_throws ArgumentError StageGraph(Any[:a => (;stage=S, deps=[:a])]) # dep on itself
-        @test_throws ArgumentError StageGraph(Any[:a => (;stage=Stage(stage_fun_a, 0), deps=[:a])]) # even if pruned
-        @test_throws ArgumentError StageGraph(Any[:a => (;stage=S, deps=[:b]), :b => (;stage=S)]) # dep on a later node
-        @test_throws ArgumentError plan(StageGraph(Any[:a => (;stage=S)]), 0)
+        S = Job(job_fun_a, 1)
+        @test_throws ArgumentError JobGraph([]; repeat_if=false) # checked though never run
+        @test_throws ArgumentError JobGraph(Any[S]) # not a pair
+        @test_throws ArgumentError JobGraph(Any["a" => (;job=S)]) # label not a Symbol
+        @test_throws ArgumentError JobGraph(Any[:a => S]) # not a NamedTuple
+        @test_throws ArgumentError JobGraph(Any[:a => (;nchunks=1)]) # no job
+        @test_throws ArgumentError JobGraph(Any[:a => (;job=S, chunks=1)]) # unknown property
+        @test_throws ArgumentError JobGraph(Any[:a => (;job=job_fun_a)]) # not a Job
+        @test_throws ArgumentError JobGraph(Any[:a => (;do_if=true, job=S)]) # a Bool is not a predicate
+        @test_throws ArgumentError JobGraph(Any[:a => (;skip_chunks=1, job=S)]) # a number is not a skip_chunks
+        @test_throws ArgumentError JobGraph(Any[:a => (;do_if=pred_a, skip_chunks=skip_a, job=S)]) # not both
+        @test_throws ArgumentError JobGraph(Any[:a => (;job=S)]; repeat_if=false)
+        @test_throws ArgumentError JobGraph(Any[:a => (;job=S), :a => (;job=S)]) # duplicate label
+        @test_throws ArgumentError JobGraph(Any[:a => (;job=S), :b => (;job=S, deps=[1])]) # dep not a Symbol
+        @test_throws ArgumentError JobGraph(Any[:a => (;job=S, deps=[:a])]) # dep on itself
+        @test_throws ArgumentError JobGraph(Any[:a => (;job=Job(job_fun_a, 0), deps=[:a])]) # even if pruned
+        @test_throws ArgumentError JobGraph(Any[:a => (;job=S, deps=[:b]), :b => (;job=S)]) # dep on a later node
+        @test_throws ArgumentError plan(JobGraph(Any[:a => (;job=S)]), 0)
     end
 
     @testset "printing" begin
-        g = StageGraph([
-            :a => (;stage=Stage(stage_fun_a, 10)),
-            :b => (;do_if=pred_a, stage=Stage(stage_fun_b, 1), deps=[:a]),
-            :c => (;stage=StageGraph([:x => (;stage=Stage(stage_fun_a, 2))]; repeat_if=pred_b), deps=[:a, :b]),
-            :d => (;skip_chunks=skip_a, stage=Stage(stage_fun_a, 3), deps=[:c]),
+        g = JobGraph([
+            :a => (;job=Job(job_fun_a, 10)),
+            :b => (;do_if=pred_a, job=Job(job_fun_b, 1), deps=[:a]),
+            :c => (;job=JobGraph([:x => (;job=Job(job_fun_a, 2))]; repeat_if=pred_b), deps=[:a, :b]),
+            :d => (;skip_chunks=skip_a, job=Job(job_fun_a, 3), deps=[:c]),
         ])
         s = repr(g)
-        @test occursin(r"Stage\((Main\.)?stage_fun_a, 10\)", s)
+        @test occursin(r"Job\((Main\.)?job_fun_a, 10\)", s)
         @test occursin(r"do_if=(Main\.)?pred_a", s) # printed as declared, not as its normalization
         @test occursin(r"skip_chunks=(Main\.)?skip_a", s)
         @test occursin(r"repeat_if=(Main\.)?pred_b", s)
         @test occursin("deps=[:b]", s) # :a was dropped, implied by :b
         # callable structs print by type name, as they may hold large state
         ctx = RunCtx()
-        s = repr(StageGraph([:a => (;do_if=RunPred(ctx, :a, isodd), stage=Stage(RunFun(ctx, :a), 3))]; repeat_if=RunPred(ctx, :r, isodd)))
-        @test s == "$StageGraph([:a => (;do_if=RunPred, stage=$Stage(RunFun, 3))]; repeat_if=RunPred)"
+        s = repr(JobGraph([:a => (;do_if=RunPred(ctx, :a, isodd), job=Job(RunFun(ctx, :a), 3))]; repeat_if=RunPred(ctx, :r, isodd)))
+        @test s == "$JobGraph([:a => (;do_if=RunPred, job=$Job(RunFun, 3))]; repeat_if=RunPred)"
         # so do closures, which would print what they capture
         big = zeros(1000)
-        s = repr(StageGraph([:a => (;do_if=info -> isempty(big), stage=Stage((chunk_idx, info) -> sum(big), 1))]))
+        s = repr(JobGraph([:a => (;do_if=info -> isempty(big), job=Job((chunk_idx, info) -> sum(big), 1))]))
         @test length(s) < 200 && !occursin("0.0", s)
-        @test count("StageGraph([", repr(MIME("text/plain"), g)) == 2
-        @test occursin(r"BuiltStageGraph\(@0x[0-9a-f]+, 2 workers\)", repr(plan(g, 2)))
+        @test count("JobGraph([", repr(MIME("text/plain"), g)) == 2
+        @test occursin(r"BuiltJobGraph\(@0x[0-9a-f]+, 2 workers\)", repr(plan(g, 2)))
     end
 
     @testset "error printing" begin
         # with no backtrace, as printing one is slow to compile
-        captured = CapturedException(ErrorException("stage fun failed"), Any[])
-        e = ParallelPlans.StageGraphError([
-            ParallelPlans.StageGraphWorkerError(1, [:c, :y], 2, captured),
-            ParallelPlans.StageGraphWorkerError(2, [:a], 0, captured), # skip_chunks, a do_if included
-            ParallelPlans.StageGraphWorkerError(3, Symbol[], -1, captured), # repeat_if of the root
+        captured = CapturedException(ErrorException("job fun failed"), Any[])
+        e = ParallelPlans.JobGraphError([
+            ParallelPlans.JobGraphWorkerError(1, [:c, :y], 2, captured),
+            ParallelPlans.JobGraphWorkerError(2, [:a], 0, captured), # skip_chunks, a do_if included
+            ParallelPlans.JobGraphWorkerError(3, Symbol[], -1, captured), # repeat_if of the root
         ])
         msg = sprint(showerror, e)
-        @test occursin("worker 1 in stage c.y chunk 2: stage fun failed", msg)
+        @test occursin("worker 1 in job c.y chunk 2: job fun failed", msg)
         @test occursin("worker 2 in the skip_chunks of a", msg)
         @test occursin("worker 3 in the repeat_if of the root graph", msg)
     end
 
     @testset "plan" begin
-        S1 = Stage(stage_fun_a, 1)
-        inner = StageGraph([
-            :x => (;stage=Stage(stage_fun_a, 2)),
-            :y => (;do_if=pred_a, stage=Stage(stage_fun_b, 1), deps=[:x]),
-            :z => (;stage=Stage(stage_fun_a, 3)),
+        S1 = Job(job_fun_a, 1)
+        inner = JobGraph([
+            :x => (;job=Job(job_fun_a, 2)),
+            :y => (;do_if=pred_a, job=Job(job_fun_b, 1), deps=[:x]),
+            :z => (;job=Job(job_fun_a, 3)),
         ]; repeat_if=pred_b)
-        g = StageGraph([
-            :a => (;stage=Stage(stage_fun_a, 10)),
-            :b => (;stage=Stage(stage_fun_b, 1), deps=[:a]),
-            :c => (;do_if=pred_b, stage=inner, deps=[:a, :b]),
-            :d => (;stage=S1, deps=[:c]),
-            :e => (;stage=inner),
+        g = JobGraph([
+            :a => (;job=Job(job_fun_a, 10)),
+            :b => (;job=Job(job_fun_b, 1), deps=[:a]),
+            :c => (;do_if=pred_b, job=inner, deps=[:a, :b]),
+            :d => (;job=S1, deps=[:c]),
+            :e => (;job=inner),
         ])
         b = plan(g, 4)
         @test b.nworkers == 4
         @test length(b.workers) == 4
         root = b.root
-        # the children are the declared nodes in order, stages as is and
+        # the children are the declared nodes in order, jobs as is and
         # nested graphs built, one per use
         @test root.labels == [:a, :b, :c, :d, :e]
-        @test root.children[1] === g.stages[1]
+        @test root.children[1] === g.jobs[1]
         @test root.children[3] isa ParallelPlans.BuiltGraphNode
         @test root.children[3] !== root.children[5]
         @test root.children[3].labels == [:x, :y, :z]
@@ -585,52 +585,52 @@ end
         @test root.rev_deps == [[2], [3], [4], [], []]
         @test root.total_dep_chunks == [0, 10, 1, 1, 0]
         @test root.total_end_chunks == 2
-        @test length(root.states) == ParallelPlans.STAGE_STATE_STRIDE * 7 # a spare stride at each end
+        @test length(root.states) == ParallelPlans.JOB_STATE_STRIDE * 7 # a spare stride at each end
         c = root.children[3]
         @test c.rev_deps == [[2], [], []]
         @test c.total_dep_chunks == [0, 2, 0]
         @test c.total_end_chunks == 4
         @test c.states !== root.children[5].states
-        # single chunk stages with deps are on_fin, run by whoever finishes
+        # single chunk jobs with deps are on_fin, run by whoever finishes
         # their last dep chunk, and not scanned
         @test root.on_fin == [false, true, false, true, false]
         @test root.scan == [1, 3, 5]
         @test c.on_fin == [false, true, false]
         @test c.scan == [1, 3]
         # but a child gets at most one on_fin rev dep
-        b2 = plan(StageGraph([
-            :a => (;stage=Stage(stage_fun_a, 2)),
-            :b => (;stage=S1, deps=[:a]),
-            :c => (;stage=S1, deps=[:a]),
-            :d => (;stage=S1, deps=[:b, :c]),
+        b2 = plan(JobGraph([
+            :a => (;job=Job(job_fun_a, 2)),
+            :b => (;job=S1, deps=[:a]),
+            :c => (;job=S1, deps=[:a]),
+            :d => (;job=S1, deps=[:b, :c]),
         ]), 2)
         @test b2.root.on_fin == [false, true, false, true]
         @test b2.root.scan == [1, 3]
         # one worker keeps only what the serial run needs
         check_serial_plan(plan(g, 1).root, root)
         # an empty graph plans to a root with no children, and no workers
-        b0 = plan(StageGraph([]), 4)
+        b0 = plan(JobGraph([]), 4)
         @test b0.nworkers == 0
         @test isempty(b0.workers)
         @test isempty(b0.root.children)
-        check_serial_plan(b0.root, plan(StageGraph([]), 1).root)
+        check_serial_plan(b0.root, plan(JobGraph([]), 1).root)
     end
 
     @testset "running pruned nodes" begin
         ctx = RunCtx()
         # an empty graph runs nothing
-        @test run_chunks(ctx, StageGraph([]), 1) == []
-        @test run_chunks(ctx, StageGraph([]), NW) == []
+        @test run_chunks(ctx, JobGraph([]), 1) == []
+        @test run_chunks(ctx, JobGraph([]), NW) == []
         # a dep through pruned nodes still orders the run, and the pruned
         # nodes' predicates are never called
-        g = StageGraph([
-            :a => (;stage=Stage(RunFun(ctx, :a), 4)),
-            :b => (;do_if=RunPred(ctx, :b, Returns(true)), stage=Stage(RunFun(ctx, :b), 0), deps=[:a]),
-            :c => (;do_if=RunPred(ctx, :c, Returns(true)), stage=StageGraph([
-                :x => (;stage=Stage(RunFun(ctx, :x), 0)),
+        g = JobGraph([
+            :a => (;job=Job(RunFun(ctx, :a), 4)),
+            :b => (;do_if=RunPred(ctx, :b, Returns(true)), job=Job(RunFun(ctx, :b), 0), deps=[:a]),
+            :c => (;do_if=RunPred(ctx, :c, Returns(true)), job=JobGraph([
+                :x => (;job=Job(RunFun(ctx, :x), 0)),
             ]; repeat_if=RunPred(ctx, :r, Returns(true))), deps=[:b]),
-            :d => (;stage=Stage(RunFun(ctx, :d), 2), deps=[:c]),
-            :e => (;stage=Stage(RunFun(ctx, :e), 3)),
+            :d => (;job=Job(RunFun(ctx, :d), 2), deps=[:c]),
+            :e => (;job=Job(RunFun(ctx, :e), 3)),
         ])
         chunks = [(:a, 1), (:a, 2), (:a, 3), (:a, 4), (:d, 1), (:d, 2), (:e, 1), (:e, 2), (:e, 3)]
         @test run_chunks(ctx, g, 1) == chunks
@@ -642,11 +642,11 @@ end
 
     @testset "chunks, deps and order" begin
         ctx = RunCtx()
-        g = StageGraph([
-            :a => (;stage=Stage(RunFun(ctx, :a), 4)),
-            :b => (;stage=Stage(RunFun(ctx, :b), 1), deps=[:a]), # on_fin
-            :c => (;stage=Stage(RunFun(ctx, :c), 2), deps=[:b]),
-            :d => (;stage=Stage(RunFun(ctx, :d), 3)),
+        g = JobGraph([
+            :a => (;job=Job(RunFun(ctx, :a), 4)),
+            :b => (;job=Job(RunFun(ctx, :b), 1), deps=[:a]), # on_fin
+            :c => (;job=Job(RunFun(ctx, :c), 2), deps=[:b]),
+            :d => (;job=Job(RunFun(ctx, :d), 3)),
         ])
         chunks = [(:a, 1), (:a, 2), (:a, 3), (:a, 4), (:b, 1), (:c, 1), (:c, 2), (:d, 1), (:d, 2), (:d, 3)]
         @test run_chunks(ctx, g, 1) == chunks
@@ -663,18 +663,18 @@ end
 
     @testset "do_if" begin
         ctx = RunCtx()
-        inner = StageGraph([
-            :x => (;stage=Stage(RunFun(ctx, :x), 2)),
-            :y => (;do_if=RunPred(ctx, :y, Returns(true)), stage=Stage(RunFun(ctx, :y), 1), deps=[:x]),
+        inner = JobGraph([
+            :x => (;job=Job(RunFun(ctx, :x), 2)),
+            :y => (;do_if=RunPred(ctx, :y, Returns(true)), job=Job(RunFun(ctx, :y), 1), deps=[:x]),
         ])
-        # a skipped stage or graph runs nothing, and its dependents proceed
-        g = StageGraph([
-            :a => (;stage=Stage(RunFun(ctx, :a), 3)),
-            :b => (;do_if=RunPred(ctx, :b, Returns(false)), stage=Stage(RunFun(ctx, :b), 2), deps=[:a]),
-            :c => (;do_if=RunPred(ctx, :c, Returns(true)), stage=Stage(RunFun(ctx, :c), 2), deps=[:a]),
-            :d => (;stage=Stage(RunFun(ctx, :d), 1), deps=[:b, :c]),
-            :e => (;do_if=RunPred(ctx, :e, Returns(false)), stage=inner, deps=[:d]),
-            :f => (;stage=Stage(RunFun(ctx, :f), 1), deps=[:e]),
+        # a skipped job or graph runs nothing, and its dependents proceed
+        g = JobGraph([
+            :a => (;job=Job(RunFun(ctx, :a), 3)),
+            :b => (;do_if=RunPred(ctx, :b, Returns(false)), job=Job(RunFun(ctx, :b), 2), deps=[:a]),
+            :c => (;do_if=RunPred(ctx, :c, Returns(true)), job=Job(RunFun(ctx, :c), 2), deps=[:a]),
+            :d => (;job=Job(RunFun(ctx, :d), 1), deps=[:b, :c]),
+            :e => (;do_if=RunPred(ctx, :e, Returns(false)), job=inner, deps=[:d]),
+            :f => (;job=Job(RunFun(ctx, :f), 1), deps=[:e]),
         ])
         chunks = [(:a, 1), (:a, 2), (:a, 3), (:c, 1), (:c, 2), (:d, 1), (:f, 1)]
         @test run_chunks(ctx, g, 1) == chunks
@@ -688,21 +688,21 @@ end
 
     @testset "skip_chunks" begin
         ctx = RunCtx()
-        inner = StageGraph([
-            :x => (;stage=Stage(RunFun(ctx, :x), 2)),
+        inner = JobGraph([
+            :x => (;job=Job(RunFun(ctx, :x), 2)),
         ])
         # skip_chunks skips that many chunks from the start, all of them when
         # ≥ nchunks, and the dependents proceed as if the skipped chunks had
-        # run. :e2 is an on_fin stage skipped, :e and :g on_fin stages run.
-        g = StageGraph([
-            :a => (;stage=Stage(RunFun(ctx, :a), 3)),
-            :b => (;skip_chunks=RunSkip(ctx, :b, Returns(2)), stage=Stage(RunFun(ctx, :b), 5), deps=[:a]),
-            :c => (;skip_chunks=RunSkip(ctx, :c, Returns(0)), stage=Stage(RunFun(ctx, :c), 2), deps=[:a]),
-            :d => (;skip_chunks=RunSkip(ctx, :d, Returns(typemax(Int))), stage=Stage(RunFun(ctx, :d), 2), deps=[:a]),
-            :e2 => (;skip_chunks=RunSkip(ctx, :e2, Returns(1)), stage=Stage(RunFun(ctx, :e2), 1), deps=[:c]),
-            :e => (;skip_chunks=RunSkip(ctx, :e, Returns(0)), stage=Stage(RunFun(ctx, :e), 1), deps=[:b, :c, :d, :e2]),
-            :f => (;skip_chunks=RunSkip(ctx, :f, Returns(1)), stage=inner, deps=[:e]), # a graph is one chunk
-            :g => (;skip_chunks=RunSkip(ctx, :g, Returns(0)), stage=Stage(RunFun(ctx, :g), 1), deps=[:f]),
+        # run. :e2 is an on_fin job skipped, :e and :g on_fin jobs run.
+        g = JobGraph([
+            :a => (;job=Job(RunFun(ctx, :a), 3)),
+            :b => (;skip_chunks=RunSkip(ctx, :b, Returns(2)), job=Job(RunFun(ctx, :b), 5), deps=[:a]),
+            :c => (;skip_chunks=RunSkip(ctx, :c, Returns(0)), job=Job(RunFun(ctx, :c), 2), deps=[:a]),
+            :d => (;skip_chunks=RunSkip(ctx, :d, Returns(typemax(Int))), job=Job(RunFun(ctx, :d), 2), deps=[:a]),
+            :e2 => (;skip_chunks=RunSkip(ctx, :e2, Returns(1)), job=Job(RunFun(ctx, :e2), 1), deps=[:c]),
+            :e => (;skip_chunks=RunSkip(ctx, :e, Returns(0)), job=Job(RunFun(ctx, :e), 1), deps=[:b, :c, :d, :e2]),
+            :f => (;skip_chunks=RunSkip(ctx, :f, Returns(1)), job=inner, deps=[:e]), # a graph is one chunk
+            :g => (;skip_chunks=RunSkip(ctx, :g, Returns(0)), job=Job(RunFun(ctx, :g), 1), deps=[:f]),
         ])
         @test ParallelPlans.plan(g, NW).root.on_fin == [false, false, false, false, true, true, false, true]
         chunks = [(:a, 1), (:a, 2), (:a, 3), (:b, 3), (:b, 4), (:b, 5), (:c, 1), (:c, 2), (:e, 1), (:g, 1)]
@@ -720,14 +720,14 @@ end
         ctx = RunCtx()
         # a graph repeats while its repeat_if is true, checked after each
         # iteration, so it runs at least once; iterations don't overlap
-        inner = StageGraph([
-            :x => (;stage=Stage(RunFun(ctx, :x), 2)),
-            :y => (;stage=Stage(RunFun(ctx, :y), 1), deps=[:x]),
+        inner = JobGraph([
+            :x => (;job=Job(RunFun(ctx, :x), 2)),
+            :y => (;job=Job(RunFun(ctx, :y), 1), deps=[:x]),
         ]; repeat_if=RunPred(ctx, :inner, n -> n < 3))
-        g = StageGraph([
-            :a => (;stage=Stage(RunFun(ctx, :a), 2)),
-            :b => (;stage=inner, deps=[:a]),
-            :c => (;stage=Stage(RunFun(ctx, :c), 1), deps=[:b]),
+        g = JobGraph([
+            :a => (;job=Job(RunFun(ctx, :a), 2)),
+            :b => (;job=inner, deps=[:a]),
+            :c => (;job=Job(RunFun(ctx, :c), 1), deps=[:b]),
         ])
         chunks = [(:a, 1), (:a, 2), (:c, 1), (:x, 1), (:x, 1), (:x, 1), (:x, 2), (:x, 2), (:x, 2), (:y, 1), (:y, 1), (:y, 1)]
         order = [:a, :a, :x, :x, :y, :x, :x, :y, :x, :x, :y, :c]
@@ -740,12 +740,12 @@ end
 
         # the root can repeat, repeats multiply, and do_ifs are reevaluated
         # each iteration
-        inner = StageGraph([
-            :x => (;stage=Stage(RunFun(ctx, :x), 1)),
+        inner = JobGraph([
+            :x => (;job=Job(RunFun(ctx, :x), 1)),
         ]; repeat_if=RunPred(ctx, :inner, isodd))
-        g = StageGraph([
-            :a => (;do_if=RunPred(ctx, :a, isodd), stage=Stage(RunFun(ctx, :a), 1)),
-            :b => (;stage=inner, deps=[:a]),
+        g = JobGraph([
+            :a => (;do_if=RunPred(ctx, :a, isodd), job=Job(RunFun(ctx, :a), 1)),
+            :b => (;job=inner, deps=[:a]),
         ]; repeat_if=RunPred(ctx, :root, n -> n < 3))
         chunks = [(:a, 1), (:a, 1), (:x, 1), (:x, 1), (:x, 1), (:x, 1), (:x, 1), (:x, 1)]
         order = [:a, :x, :x, :x, :x, :a, :x, :x]
@@ -760,9 +760,9 @@ end
         counter = Threads.Atomic{Int}(0)
         bump(chunk_idx, info) = Threads.atomic_add!(counter, 1)
         steps = Ref(0)
-        g = StageGraph([
-            :a => (;stage=Stage(bump, 1)),
-            :b => (;stage=Stage(bump, 1), deps=[:a]),
+        g = JobGraph([
+            :a => (;job=Job(bump, 1)),
+            :b => (;job=Job(bump, 1), deps=[:a]),
         ]; repeat_if=info -> (steps[] += 1) < 20_000)
         run_long(nw) = (counter[] = 0; steps[] = 0; run!(plan(g, nw)); (steps[], counter[]))
         @test run_long(1) == (20_000, 40_000)
@@ -774,9 +774,9 @@ end
         # While :a's one chunk runs the other workers run out of spins and
         # sleep. Finishing :a publishes :b's chunks, more than the finisher
         # can take, so it wakes them and they share :b.
-        g = StageGraph([
-            :a => (;stage=Stage(SlowFun(RunFun(ctx, :a), 0.05), 1)),
-            :b => (;stage=Stage(SlowFun(RunFun(ctx, :b), 0.01), 4 * NW), deps=[:a]),
+        g = JobGraph([
+            :a => (;job=Job(SlowFun(RunFun(ctx, :a), 0.05), 1)),
+            :b => (;job=Job(SlowFun(RunFun(ctx, :b), 0.01), 4 * NW), deps=[:a]),
         ])
         b = plan(g, NW)
         chunks = [(:a, 1); [(:b, i) for i in 1:4 * NW]]
@@ -793,60 +793,60 @@ end
     @testset "errors" begin
         throw_fun(chunk_idx, info) = error("boom")
         ctx = RunCtx()
-        inner = StageGraph([:x => (;stage=Stage(throw_fun, 3))])
-        g = StageGraph([
-            :a => (;stage=Stage(RunFun(ctx, :a), 4)),
-            :b => (;stage=inner, deps=[:a]),
-            :c => (;stage=Stage(RunFun(ctx, :c), 2), deps=[:b]),
+        inner = JobGraph([:x => (;job=Job(throw_fun, 3))])
+        g = JobGraph([
+            :a => (;job=Job(RunFun(ctx, :a), 4)),
+            :b => (;job=inner, deps=[:a]),
+            :c => (;job=Job(RunFun(ctx, :c), 2), deps=[:b]),
         ])
-        # serially, an ErrorException naming the stage and chunk
+        # serially, an ErrorException naming the job and chunk
         e = run_error(ctx, g, 1)
         @test e isa ErrorException
-        @test occursin("in stage b.x chunk 1", e.msg)
+        @test occursin("in job b.x chunk 1", e.msg)
         @test sort!([(e.id, e.chunk) for e in ctx.events]) == [(:a, 1), (:a, 2), (:a, 3), (:a, 4)]
-        # in parallel, a StageGraphError with each erroring worker's error,
+        # in parallel, a JobGraphError with each erroring worker's error,
         # and no chunk starts after the first error
         e = run_error(ctx, g, NW)
-        @test e isa ParallelPlans.StageGraphError
+        @test e isa ParallelPlans.JobGraphError
         @test 1 ≤ length(e.worker_errors) ≤ 3
         @test allunique([we.worker_idx for we in e.worker_errors])
         @test all(we.err.ex == ErrorException("boom") for we in e.worker_errors)
-        @test all(occursin(r"^in stage b.x chunk [123]$", w) for w in error_wheres(e))
+        @test all(occursin(r"^in job b.x chunk [123]$", w) for w in error_wheres(e))
         @test sort!([(e.id, e.chunk) for e in ctx.events]) == [(:a, 1), (:a, 2), (:a, 3), (:a, 4)]
 
         # predicate errors are attributed to the predicate; a do_if is
         # reported as the skip_chunks it is normalized to
-        check_pred_error(ctx, StageGraph([
-            :a => (;do_if=RunPred(ctx, :a, n -> error("pred")), stage=Stage(RunFun(ctx, :a), 4)),
+        check_pred_error(ctx, JobGraph([
+            :a => (;do_if=RunPred(ctx, :a, n -> error("pred")), job=Job(RunFun(ctx, :a), 4)),
         ]), "in the skip_chunks of a", NW)
         # a negative skip_chunks return is an error, attributed to it
-        check_pred_error(ctx, StageGraph([
-            :a => (;skip_chunks=RunSkip(ctx, :a, Returns(-1)), stage=Stage(RunFun(ctx, :a), 4)),
+        check_pred_error(ctx, JobGraph([
+            :a => (;skip_chunks=RunSkip(ctx, :a, Returns(-1)), job=Job(RunFun(ctx, :a), 4)),
         ]), "in the skip_chunks of a", NW)
-        check_pred_error(ctx, StageGraph([
-            :a => (;stage=Stage(RunFun(ctx, :a), 4)),
+        check_pred_error(ctx, JobGraph([
+            :a => (;job=Job(RunFun(ctx, :a), 4)),
         ]; repeat_if=RunPred(ctx, :r, n -> error("rep"))), "in the repeat_if of the root graph", NW)
-        check_pred_error(ctx, StageGraph([
-            :a => (;stage=Stage(RunFun(ctx, :a), 4)),
-            :b => (;stage=StageGraph([:x => (;stage=Stage(RunFun(ctx, :x), 1))]; repeat_if=RunPred(ctx, :r, n -> error("rep"))), deps=[:a]),
+        check_pred_error(ctx, JobGraph([
+            :a => (;job=Job(RunFun(ctx, :a), 4)),
+            :b => (;job=JobGraph([:x => (;job=Job(RunFun(ctx, :x), 1))]; repeat_if=RunPred(ctx, :r, n -> error("rep"))), deps=[:a]),
         ]), "in the repeat_if of b", NW)
 
         # a reused graph is attributed to the node it ran at
-        g = StageGraph([
-            :c => (;do_if=RunPred(ctx, :c, Returns(false)), stage=inner),
-            :e => (;stage=inner, deps=[:c]),
+        g = JobGraph([
+            :c => (;do_if=RunPred(ctx, :c, Returns(false)), job=inner),
+            :e => (;job=inner, deps=[:c]),
         ])
-        @test occursin("in stage e.x chunk 1", run_error(ctx, g, 1).msg)
-        @test all(occursin("in stage e.x chunk", w) for w in error_wheres(run_error(ctx, g, NW)))
+        @test occursin("in job e.x chunk 1", run_error(ctx, g, 1).msg)
+        @test all(occursin("in job e.x chunk", w) for w in error_wheres(run_error(ctx, g, NW)))
 
         # a plan that errored runs again
         flag = Ref(true)
-        g = StageGraph([
-            :a => (;stage=Stage((chunk_idx, info) -> (flag[] && error("once"); nothing), 2)),
-            :b => (;stage=Stage(RunFun(ctx, :b), 2), deps=[:a]),
+        g = JobGraph([
+            :a => (;job=Job((chunk_idx, info) -> (flag[] && error("once"); nothing), 2)),
+            :b => (;job=Job(RunFun(ctx, :b), 2), deps=[:a]),
         ])
         b = plan(g, NW)
-        @test run_error(ctx, b) isa ParallelPlans.StageGraphError
+        @test run_error(ctx, b) isa ParallelPlans.JobGraphError
         flag[] = false
         @test run_chunks(ctx, b) == [(:b, 1), (:b, 2)]
     end

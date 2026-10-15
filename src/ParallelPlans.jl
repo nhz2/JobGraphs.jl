@@ -4,29 +4,29 @@ module ParallelPlans
 
 #=
 # Order is priority
-foo = StageGraph([
-    :a => (;stage=Stage(fun1, 10)),
-    :b => (;stage=Stage(fun1_fin, 1), deps=[:a,]),
+foo = JobGraph([
+    :a => (;job=Job(fun1, 10)),
+    :b => (;job=Job(fun1_fin, 1), deps=[:a,]),
 ])
 
 # Nesting is supported (labels are namespaced and become paths)
-bar = StageGraph([
-    :a => (;stage=Stage(fun2, 10)),
-    :b => (;stage=Stage(fun3, 2), deps=[:a,]),
-    :c => (;stage=foo, deps=[:a, :b]),
+bar = JobGraph([
+    :a => (;job=Job(fun2, 10)),
+    :b => (;job=Job(fun3, 2), deps=[:a,]),
+    :c => (;job=foo, deps=[:a, :b]),
 ])
 
 # Nodes can have predicates
-# StageGraphs can be repeated
-bar = StageGraph([
-    :a => (;stage=Stage(fun2, 10)),
-    :b => (;do_if=info->do_b, stage=Stage(fun3, 2), deps=[:a,]),
-    :c => (;skip_chunks=info->8-cld(npairs, pairs_per_chunk), stage=Stage(fun4, 8), deps=[:b,]),
-    :d => (;stage=foo, deps=[:a, :b]),
+# JobGraphs can be repeated
+bar = JobGraph([
+    :a => (;job=Job(fun2, 10)),
+    :b => (;do_if=info->do_b, job=Job(fun3, 2), deps=[:a,]),
+    :c => (;skip_chunks=info->8-cld(npairs, pairs_per_chunk), job=Job(fun4, 8), deps=[:b,]),
+    :d => (;job=foo, deps=[:a, :b]),
 ]; repeat_if=info->((step+=1) < N))
 
-# TODO add in needed CUDACore.CuEvents if stages have cuda kernels
-# This likely means marking a stage as uses cuda, and padding the CUDACore module to
+# TODO add in needed CUDACore.CuEvents if jobs have cuda kernels
+# This likely means marking a job as uses cuda, and padding the CUDACore module to
 # plan, so it can use the functions without depending on CUDACore here
 
 my_plan = plan(bar, 16) # 16 workers
@@ -37,8 +37,8 @@ run!(my_plan)
 """
     WorkerInfo
 
-Passed to a stage's `fun` and to the `do_if`, `skip_chunks` and `repeat_if`
-predicates, describing the worker calling them, see [`Stage`](@ref).
+Passed to a job's `fun` and to the `do_if`, `skip_chunks` and `repeat_if`
+predicates, describing the worker calling them, see [`Job`](@ref).
 
 Fields:
 - `worker_idx::Int`: the calling worker, in `1:nworkers`. Key per worker
@@ -51,22 +51,22 @@ mutable struct WorkerInfo
 end
 
 """
-    Stage(fun, nchunks::Int)
+    Job(fun, nchunks::Int)
 
-The leaf in a [`StageGraph`](@ref) tree.
+The leaf in a [`JobGraph`](@ref) tree.
 
 `fun(chunk_idx::Int, info::WorkerInfo) -> nothing` is run in parallel across
 `nchunks`. `chunk_idx` is in `1:nchunks` and `info` describes the calling
 worker, see [`WorkerInfo`](@ref). Capture input and output in `fun`.
 
-A `Stage` with zero chunks is pruned from any [`StageGraph`](@ref) it is put in.
+A `Job` with zero chunks is pruned from any [`JobGraph`](@ref) it is put in.
 
 Per worker scratch must be keyed by `info.worker_idx`.
 """
-struct Stage
+struct Job
     fun::Any
     nchunks::Int
-    Base.@nospecializeinfer function Stage(fun::Any, nchunks::Int)
+    Base.@nospecializeinfer function Job(fun::Any, nchunks::Int)
         @nospecialize
         if nchunks < 0 || nchunks ≥ 2^30
             throw(ArgumentError("nchunks must be in 0:$(2^30 - 1)"))
@@ -89,18 +89,18 @@ else
 end
 
 """
-    StageGraph(nodes::AbstractVector; repeat_if=nothing)
+    JobGraph(nodes::AbstractVector; repeat_if=nothing)
 
-A DAG of [`Stage`](@ref)s and nested `StageGraph`s, declared as a vector of
-`label::Symbol => (;skip_chunks, stage, deps)` pairs. `stage` is a `Stage` or a
-`StageGraph`; `deps` is a collection of earlier nodes this
+A DAG of [`Job`](@ref)s and nested `JobGraph`s, declared as a vector of
+`label::Symbol => (;skip_chunks, job, deps)` pairs. `job` is a `Job` or a
+`JobGraph`; `deps` is a collection of earlier nodes this
 node depends on, or a lone `Symbol` for a single dep; `skip_chunks`, or the
 simpler `do_if`, is an optional predicate. Declaration order is roughly the
 scheduling priority, a load balancing hint.
 
 - `skip_chunks(info::WorkerInfo)::Int` is called once each time the node's
   deps are all done, returning how many of the node's chunks to skip: of the
-  node's `nchunks` chunks (1 for a nested `StageGraph`), chunks
+  node's `nchunks` chunks (1 for a nested `JobGraph`), chunks
   `skip + 1:nchunks` run and the first `skip` don't. So 0 runs the whole node,
   and anything ≥ `nchunks`, `typemax(Int)` say, skips it entirely: nothing in
   it runs, and the nodes that dep on it proceed as if it had run. A negative
@@ -112,27 +112,27 @@ scheduling priority, a load balancing hint.
   graph is done. If it returns `true` the graph runs again from the start (its
   `skip_chunks` are reevaluated), else the graph is done, like a do-while loop.
 
-If a `Stage` has zero chunks or a nested `StageGraph` is empty, it will be pruned.
+If a `Job` has zero chunks or a nested `JobGraph` is empty, it will be pruned.
 Its `skip_chunks` is never run but transitive dependencies are still respected.
 A graph left with no nodes, whether declared empty or emptied by pruning, drops
 its `repeat_if`, which is never run.
 
-Build a runnable [`BuiltStageGraph`](@ref) with [`plan`](@ref).
+Build a runnable [`BuiltJobGraph`](@ref) with [`plan`](@ref).
 """
-struct StageGraph
+struct JobGraph
     labels::Vector{Symbol}
-    stages::Vector{Union{Stage, StageGraph}}
+    jobs::Vector{Union{Job, JobGraph}}
     # Indices of the earlier nodes each node deps on, in decreasing order, with
     # duplicate deps and deps already implied by another dep dropped.
     deps::Vector{Vector{Int}}
     # per node: nothing, or the skip_chunks function, a do_if wrapped in DoIfSkip
     skip_chunks::Vector{Any}
     repeat_if::Any # nothing, or the repeat_if predicate
-    Base.@nospecializeinfer function StageGraph(nodes::AbstractVector; repeat_if=nothing)
+    Base.@nospecializeinfer function JobGraph(nodes::AbstractVector; repeat_if=nothing)
         @nospecialize repeat_if
         _check_predicate(repeat_if, "repeat_if")
         labels = Symbol[]
-        stages = Union{Stage, StageGraph}[]
+        jobs = Union{Job, JobGraph}[]
         deps = Vector{Int}[]
         skip_chunks = Any[]
         # each bit vector has that node and its transitive deps true
@@ -143,26 +143,26 @@ struct StageGraph
         pruned_empty = Dict{Symbol, Vector{Int}}()
         for node in nodes
             if !(node isa Pair{Symbol, <:NamedTuple})
-                throw(ArgumentError("each node must be a `label::Symbol => (;stage, deps, skip_chunks)` pair, got a $(typeof(node))"))
+                throw(ArgumentError("each node must be a `label::Symbol => (;job, deps, skip_chunks)` pair, got a $(typeof(node))"))
             end
             label::Symbol = node.first
             props::NamedTuple = node.second
             if label ∈ labels || haskey(pruned_empty, label)
-                throw(ArgumentError("duplicate stage label $(repr(label))"))
+                throw(ArgumentError("duplicate job label $(repr(label))"))
             end
-            if !issubset(propertynames(props), (:stage, :deps, :do_if, :skip_chunks)) || !haskey(props, :stage)
-                throw(ArgumentError("stage $(repr(label)): node properties must be `stage` and optionally `deps` and `do_if` or `skip_chunks`, got $(propertynames(props))"))
+            if !issubset(propertynames(props), (:job, :deps, :do_if, :skip_chunks)) || !haskey(props, :job)
+                throw(ArgumentError("job $(repr(label)): node properties must be `job` and optionally `deps` and `do_if` or `skip_chunks`, got $(propertynames(props))"))
             end
-            stage = props.stage
-            if !(stage isa Union{Stage, StageGraph})
-                throw(ArgumentError("stage $(repr(label)): `stage` must be a Stage or StageGraph, got a $(typeof(stage))"))
+            job = props.job
+            if !(job isa Union{Job, JobGraph})
+                throw(ArgumentError("job $(repr(label)): `job` must be a Job or JobGraph, got a $(typeof(job))"))
             end
             do_if = get(props, :do_if, nothing)
-            _check_predicate(do_if, "stage $(repr(label)): do_if")
+            _check_predicate(do_if, "job $(repr(label)): do_if")
             skip_pred = get(props, :skip_chunks, nothing)
-            _check_skip_chunks(skip_pred, "stage $(repr(label)): skip_chunks")
+            _check_skip_chunks(skip_pred, "job $(repr(label)): skip_chunks")
             if !isnothing(skip_pred) && !isnothing(do_if)
-                throw(ArgumentError("stage $(repr(label)): give `do_if` or `skip_chunks`, not both"))
+                throw(ArgumentError("job $(repr(label)): give `do_if` or `skip_chunks`, not both"))
             end
             if isnothing(skip_pred) && !isnothing(do_if)
                 skip_pred = DoIfSkip(do_if) # normalize: downstream it's all skip_chunks
@@ -174,7 +174,7 @@ struct StageGraph
             end
             for dep in raw_deps
                 if !(dep isa Symbol)
-                    throw(ArgumentError("stage $(repr(label)): deps must be Symbols, got a $(typeof(dep))"))
+                    throw(ArgumentError("job $(repr(label)): deps must be Symbols, got a $(typeof(dep))"))
                 end
                 di = findfirst(==(dep), labels)
                 if !isnothing(di)
@@ -182,7 +182,7 @@ struct StageGraph
                 elseif haskey(pruned_empty, dep)
                     append!(dep_idxs, pruned_empty[dep])
                 else
-                    throw(ArgumentError("stage $(repr(label)): dep $(repr(dep)) does not name an earlier stage"))
+                    throw(ArgumentError("job $(repr(label)): dep $(repr(dep)) does not name an earlier job"))
                 end
             end
             # Now prune redundant deps. Decreasing order makes one pass exact: a
@@ -197,11 +197,11 @@ struct StageGraph
                     all_deps_i .|= all_deps[dep]
                 end
             end
-            if _is_stage_empty(stage)
+            if _is_job_empty(job)
                 pruned_empty[label] = pruned_dep_idxs
             else
                 push!(labels, label)
-                push!(stages, stage)
+                push!(jobs, job)
                 push!(deps, pruned_dep_idxs)
                 push!(skip_chunks, skip_pred)
                 all_deps_i[length(labels)] = true
@@ -212,12 +212,12 @@ struct StageGraph
             # Nothing to repeat, whether nodes was empty or all of it pruned.
             repeat_if = nothing
         end
-        new(labels, stages, deps, skip_chunks, repeat_if)
+        new(labels, jobs, deps, skip_chunks, repeat_if)
     end
 end
 
-_is_stage_empty(s::Stage) = iszero(s.nchunks)
-_is_stage_empty(s::StageGraph) = isempty(s.labels)
+_is_job_empty(s::Job) = iszero(s.nchunks)
+_is_job_empty(s::JobGraph) = isempty(s.labels)
 
 # Predicates can be any callable, but a Bool is a likely mistake, so reject it.
 Base.@nospecializeinfer function _check_predicate(pred, what::String)
@@ -247,8 +247,8 @@ function _show_callable(io::IO, f)
     end
 end
 
-function Base.show(io::IO, s::Stage)
-    print(io, Stage, "(")
+function Base.show(io::IO, s::Job)
+    print(io, Job, "(")
     _show_callable(io, s.fun)
     print(io, ", ", s.nchunks, ")")
 end
@@ -256,8 +256,8 @@ end
 # Both show methods print the declaration the graph came from, with the deps the
 # constructor dropped left out. The MIME"text/plain" one puts each node on its
 # own line, indenting nested graphs.
-function Base.show(io::IO, g::StageGraph)
-    print(io, StageGraph, "([")
+function Base.show(io::IO, g::JobGraph)
+    print(io, JobGraph, "([")
     for i in eachindex(g.labels)
         isone(i) || print(io, ", ")
         _show_node(io, g, i, nothing)
@@ -267,13 +267,13 @@ function Base.show(io::IO, g::StageGraph)
     print(io, ")")
 end
 
-function Base.show(io::IO, ::MIME"text/plain", g::StageGraph)
+function Base.show(io::IO, ::MIME"text/plain", g::JobGraph)
     _show_multiline(io, g, "")
 end
 
-function _show_multiline(io::IO, g::StageGraph, indent::String)
+function _show_multiline(io::IO, g::JobGraph, indent::String)
     inner = indent * "    "
-    print(io, StageGraph, "([\n")
+    print(io, JobGraph, "([\n")
     for i in eachindex(g.labels)
         print(io, inner)
         _show_node(io, g, i, inner)
@@ -284,17 +284,17 @@ function _show_multiline(io::IO, g::StageGraph, indent::String)
     print(io, ")")
 end
 
-function _show_repeat_if(io::IO, g::StageGraph)
+function _show_repeat_if(io::IO, g::JobGraph)
     if !isnothing(g.repeat_if)
         print(io, "; repeat_if=")
         _show_callable(io, g.repeat_if)
     end
 end
 
-# Print node i as a `label => (;skip_chunks, stage, deps)` pair, a wrapped
+# Print node i as a `label => (;skip_chunks, job, deps)` pair, a wrapped
 # do_if as the `do_if` it was declared with. `indent` is the
 # indentation to print a nested graph at, or nothing to print it on one line.
-function _show_node(io::IO, g::StageGraph, i::Int, indent::Union{String, Nothing})
+function _show_node(io::IO, g::JobGraph, i::Int, indent::Union{String, Nothing})
     show(io, g.labels[i])
     print(io, " => (;")
     skip_pred = g.skip_chunks[i]
@@ -307,9 +307,9 @@ function _show_node(io::IO, g::StageGraph, i::Int, indent::Union{String, Nothing
         _show_callable(io, skip_pred)
         print(io, ", ")
     end
-    print(io, "stage=")
-    s = g.stages[i]
-    if s isa StageGraph && !isnothing(indent)
+    print(io, "job=")
+    s = g.jobs[i]
+    if s isa JobGraph && !isnothing(indent)
         _show_multiline(io, s, indent)
     else
         show(io, s)
@@ -324,12 +324,12 @@ end
 
 
 # plan turns the declaration into a tree of BuiltGraphNodes, one per graph (a
-# StageGraph reused at several nodes gets one per use), whose children are the
-# Stages and nested BuiltGraphNodes in declaration order. run! workers scan the
+# JobGraph reused at several nodes gets one per use), whose children are the
+# Jobs and nested BuiltGraphNodes in declaration order. run! workers scan the
 # tree depth first in declaration order, descending into active graphs,
 # readying the children that became ready, and claiming chunks of each
-# claimable stage they pass until it is exhausted, so declaration order is a
-# soft priority. Single chunk stages marked on_fin at build time are never
+# claimable job they pass until it is exhausted, so declaration order is a
+# soft priority. Single chunk jobs marked on_fin at build time are never
 # scanned: the worker that finishes their last dep chunk runs them itself.
 #
 # Each BuiltGraphNode owns the runtime counters of its children in one
@@ -343,34 +343,34 @@ end
 #
 # The line is 64 bytes on most targets but 128 on Apple silicon
 const CACHE_LINE = 128
-const STAGE_STATE_STRIDE = CACHE_LINE ÷ sizeof(Int)
+const JOB_STATE_STRIDE = CACHE_LINE ÷ sizeof(Int)
 
 # done_ctr: unfinished chunks of the graph's end children, those nothing depend
 # on. The worker that takes it to 0 is elected to run repeat_if, then either
 # reactivate the graph or finish it as a child of its parent.
-_done_idx() = STAGE_STATE_STRIDE + 1
+_done_idx() = JOB_STATE_STRIDE + 1
 # ready_ctr: unfinished dep chunks of the child. Decremented by the worker that
 # finishes each chunk the child deps on, or by a dep's whole chunk count at
 # once when that dep is skipped; the one that takes it to 0 marks the child
 # ready in its claim_ctr, or runs it itself.
-_ready_idx(i::Int) = (i + 1) * STAGE_STATE_STRIDE + 1
+_ready_idx(i::Int) = (i + 1) * JOB_STATE_STRIDE + 1
 # claim_ctr: the child's state, one of these, in the order they happen:
-#   CLAIM_NOT_READY    its ready_ctr is not 0 yet; an on_fin stage, run by the
+#   CLAIM_NOT_READY    its ready_ctr is not 0 yet; an on_fin job, run by the
 #                      finisher of its last dep chunk, stays here unscanned
-#   CLAIM_READY        ready: a stage with a skip_chunks to evaluate, or a
+#   CLAIM_READY        ready: a job with a skip_chunks to evaluate, or a
 #                      graph.
-#                      The first worker to bump it (a stage) or compare-and-swap
+#                      The first worker to bump it (a job) or compare-and-swap
 #                      it from CLAIM_READY to CLAIM_READYING (a graph) is
 #                      elected to ready the child, evaluating its skip_chunks,
-#                      if any, and then publishing the stage or activating the
-#                      nested graph. A stage with no skip_chunks skips these
+#                      if any, and then publishing the job or activating the
+#                      nested graph. A job with no skip_chunks skips these
 #                      two states: whoever readies it publishes it itself. A
 #                      graph always goes through them, so its counters are
 #                      reset in one place, by the one elected worker, see
 #                      _publish!.
 #   CLAIM_READYING+k   being readied by a worker
-#   0 ≤ n < nchunks    stage: n chunks claimed or skipped so far (a partially
-#                      skipped stage is published at its skip count, so bumps
+#   0 ≤ n < nchunks    job: n chunks claimed or skipped so far (a partially
+#                      skipped job is published at its skip count, so bumps
 #                      claim chunks skip+1:nchunks); graph: active (n = 0)
 #   nchunks ≤ n        exhausted: every chunk claimed (bumps may overshoot),
 #                      the child skipped, or the graph done
@@ -380,27 +380,27 @@ _ready_idx(i::Int) = (i + 1) * STAGE_STATE_STRIDE + 1
 # changes nothing that matters, and on CLAIM_READY it is the election, so that
 # worker readies the child then. Graphs are elected by a swap, so no bump
 # ever lands on an active graph's 0.
-_claim_idx(i::Int) = (i + 1) * STAGE_STATE_STRIDE + 2
+_claim_idx(i::Int) = (i + 1) * JOB_STATE_STRIDE + 2
 const CLAIM_READY = 2^61 # > any nchunks plus any overshoot
 const CLAIM_READYING = CLAIM_READY + 1
 const CLAIM_NOT_READY = 2^62 # > CLAIM_READYING plus any stale bumps
 
-# One graph of a BuiltStageGraph.
+# One graph of a BuiltJobGraph.
 mutable struct BuiltGraphNode
     const labels::Vector{Symbol} # per child
-    const children::Vector{Union{BuiltGraphNode, Stage}}
+    const children::Vector{Union{BuiltGraphNode, Job}}
     const rev_deps::Vector{Vector{Int}} # per child: the later siblings that dep on it, increasing
     const total_dep_chunks::Vector{Int} # per child: chunks of its deps, the initial ready_ctr
     const total_end_chunks::Int # chunks of the end children, the initial done_ctr
     # per child: nothing, or the skip_chunks function, a do_if wrapped in DoIfSkip
     const skip_chunks::Vector{Any}
     const repeat_if::Any # nothing, or the repeat_if predicate
-    # on_fin: per child, whether it is a single chunk stage run by the worker
+    # on_fin: per child, whether it is a single chunk job run by the worker
     # that finishes its last dep chunk, rather than marked ready for scanning.
     # Each child has at most one on_fin rev dep.
     const on_fin::Vector{Bool}
     const scan::Vector{Int} # the children scanning workers look at: those not on_fin
-    const states::AtomicMemory{Int} # STAGE_STATE_STRIDE*(length(children)+2) Ints, see _done_idx, _ready_idx and _claim_idx
+    const states::AtomicMemory{Int} # JOB_STATE_STRIDE*(length(children)+2) Ints, see _done_idx, _ready_idx and _claim_idx
 end
 
 function Base.show(io::IO, node::BuiltGraphNode)
@@ -409,18 +409,18 @@ end
 
 # Return the BuiltGraphNode for g.
 # Its nested graphs are built recursively.
-function _build(g::StageGraph, nworkers::Int)
+function _build(g::JobGraph, nworkers::Int)
     n = length(g.labels)
     if isone(nworkers) || iszero(n)
         # The dependency tracking isn't needed. Only the root can be empty,
         # empty nested graphs having been pruned, and run! does nothing for it.
         return BuiltGraphNode(
-            copy(g.labels), Union{BuiltGraphNode, Stage}[s isa Stage ? s : _build(s, nworkers) for s in g.stages],
+            copy(g.labels), Union{BuiltGraphNode, Job}[s isa Job ? s : _build(s, nworkers) for s in g.jobs],
             Vector{Int}[], Int[], 0, copy(g.skip_chunks), g.repeat_if,
             Bool[], Int[], AtomicMemory{Int}(undef, 0),
         )
     end
-    nchunks = [s isa Stage ? s.nchunks : 1 for s in g.stages]
+    nchunks = [s isa Job ? s.nchunks : 1 for s in g.jobs]
     rev_deps = [Int[] for _ in 1:n]
     total_dep_chunks = zeros(Int, n)
     for i in 1:n
@@ -437,52 +437,52 @@ function _build(g::StageGraph, nworkers::Int)
         end
     end
     @assert !iszero(total_end_chunks)
-    # Greedily mark on_fin stages in declaration order, keeping at most one
+    # Greedily mark on_fin jobs in declaration order, keeping at most one
     # on_fin rev dep per child.
     on_fin = fill(false, n)
     has_onfin_rev_dep = fill(false, n)
     for i in 1:n
-        s = g.stages[i]
+        s = g.jobs[i]
         deps = g.deps[i]
-        if s isa Stage && isone(s.nchunks) && !isempty(deps) && !any(d -> has_onfin_rev_dep[d], deps)
+        if s isa Job && isone(s.nchunks) && !isempty(deps) && !any(d -> has_onfin_rev_dep[d], deps)
             on_fin[i] = true
             for d in deps
                 has_onfin_rev_dep[d] = true
             end
         end
     end
-    states = AtomicMemory{Int}(undef, STAGE_STATE_STRIDE * (n + 2))
+    states = AtomicMemory{Int}(undef, JOB_STATE_STRIDE * (n + 2))
     for i in eachindex(states)
         @atomic :monotonic states[i] = CLAIM_NOT_READY # nothing to do until activated
     end
     BuiltGraphNode(
-        copy(g.labels), Union{BuiltGraphNode, Stage}[s isa Stage ? s : _build(s, nworkers) for s in g.stages],
+        copy(g.labels), Union{BuiltGraphNode, Job}[s isa Job ? s : _build(s, nworkers) for s in g.jobs],
         rev_deps, total_dep_chunks, total_end_chunks, copy(g.skip_chunks), g.repeat_if,
         on_fin, findall(!, on_fin), states,
     )
 end
 
 """
-    plan(g::StageGraph, nworkers::Int; compile=true)::BuiltStageGraph
+    plan(g::JobGraph, nworkers::Int; compile=true)::BuiltJobGraph
 
 Plan `g` for [`run!`](@ref) on `nworkers` workers.
 
 With more than one worker and `compile`, every `fun` and predicate of `g` is
 compiled here, so the first `run!` does not compile them in a worker while
 the others wait. That is a compile per new type of `fun` or predicate, and a
-lookup of about a microsecond per stage once they are compiled, so pass
+lookup of about a microsecond per job once they are compiled, so pass
 `compile=false` when planning often.
 
 The returned object cannot be `run!` concurrently.
 """
-function plan(g::StageGraph, nworkers::Int; compile::Bool=true)
+function plan(g::JobGraph, nworkers::Int; compile::Bool=true)
     if nworkers ≤ 0
         throw(ArgumentError("nworkers must be positive"))
     end
     if nworkers ≥ 2^16
         throw(ArgumentError("nworkers must be less than 2^16. Got $(nworkers)"))
     end
-    built = BuiltStageGraph(_build(g, nworkers), nworkers)
+    built = BuiltJobGraph(_build(g, nworkers), nworkers)
     if compile && nworkers > 1
         _compile!(built.root)
     end
@@ -490,8 +490,8 @@ function plan(g::StageGraph, nworkers::Int; compile::Bool=true)
 end
 
 # Compile what the parallel run! calls for each fun and predicate of the tree
-# under node: the predicates; the funs of on_fin stages, which _finish!
-# calls directly; and the claim loop specialized on the fun of every scanned stage,
+# under node: the predicates; the funs of on_fin jobs, which _finish!
+# calls directly; and the claim loop specialized on the fun of every scanned job,
 # which calls it statically inside.
 function _compile!(node::BuiltGraphNode)
     for (i, child) in enumerate(node.children)
@@ -502,42 +502,42 @@ function _compile!(node::BuiltGraphNode)
         elseif node.on_fin[i]
             precompile(child.fun, (Int, WorkerInfo))
         else
-            precompile(_claim!, (typeof(child.fun), BuiltStageGraph, WorkerState, BuiltGraphNode, Int, Int))
+            precompile(_claim!, (typeof(child.fun), BuiltJobGraph, WorkerState, BuiltGraphNode, Int, Int))
         end
     end
     isnothing(node.repeat_if) || precompile(node.repeat_if, (WorkerInfo,))
     nothing
 end
 
-struct StageGraphWorkerError
+struct JobGraphWorkerError
     worker_idx::Int
     label::Vector{Symbol} # node whose fun or predicate threw; empty for the root graph
-    chunk_idx::Int # > 0 chunk of the stage; 0 the node's skip_chunks; -1 the graph's repeat_if; 0 with an empty label: outside any fun or predicate
+    chunk_idx::Int # > 0 chunk of the job; 0 the node's skip_chunks; -1 the graph's repeat_if; 0 with an empty label: outside any fun or predicate
     err::CapturedException
 end
 
 # Thrown by run! when workers error; shows each worker's exception and backtrace.
-struct StageGraphError <: Exception
-    worker_errors::Vector{StageGraphWorkerError}
+struct JobGraphError <: Exception
+    worker_errors::Vector{JobGraphWorkerError}
 end
 
-function Base.showerror(io::IO, e::StageGraphError)
-    print(io, "StageGraphError: ", length(e.worker_errors), " worker(s) errored")
+function Base.showerror(io::IO, e::JobGraphError)
+    print(io, "JobGraphError: ", length(e.worker_errors), " worker(s) errored")
     for we in e.worker_errors
         print(io, "\n\nworker ", we.worker_idx, " ", _where_string(we.label, we.chunk_idx), ": ")
         showerror(io, we.err)
     end
 end
 
-# Return where a worker was when it threw, like "in stage a.b chunk 3".
-# From its attribution fields, see StageGraphWorkerError.
+# Return where a worker was when it threw, like "in job a.b chunk 3".
+# From its attribution fields, see JobGraphWorkerError.
 function _where_string(label::Vector{Symbol}, chunk_idx::Int)
     if isempty(label) && iszero(chunk_idx)
-        return "outside any stage or predicate"
+        return "outside any job or predicate"
     end
     name = isempty(label) ? "the root graph" : join(label, '.')
     if chunk_idx > 0
-        "in stage $name chunk $chunk_idx"
+        "in job $name chunk $chunk_idx"
     elseif iszero(chunk_idx)
         "in the skip_chunks of $name"
     else
@@ -549,10 +549,10 @@ end
 mutable struct WorkerState
     const info::WorkerInfo # passed to the funs and predicates this worker calls
     # The fun or predicate running, for error attribution, as (graph, child,
-    # chunk_idx as StageGraphWorkerError.chunk_idx); child 0 is the graph's
+    # chunk_idx as JobGraphWorkerError.chunk_idx); child 0 is the graph's
     # repeat_if, and (root, 0, 0) is none.
     at::Tuple{BuiltGraphNode, Int, Int}
-    err::Union{Nothing, StageGraphWorkerError}
+    err::Union{Nothing, JobGraphWorkerError}
     WorkerState(idx::Int, root::BuiltGraphNode) = new(WorkerInfo(idx), (root, 0, 0), nothing)
 end
 
@@ -608,19 +608,19 @@ function _call_repeat_if(w::WorkerState, node::BuiltGraphNode)::Bool
     node.repeat_if(w.info)::Bool
 end
 
-# Padding to keep an atomic field on its own cache line in BuiltStageGraph.
+# Padding to keep an atomic field on its own cache line in BuiltJobGraph.
 const CACHE_LINE_PAD = Tuple(zeros(UInt8, CACHE_LINE - sizeof(UInt64)))
 
 """
-    BuiltStageGraph
+    BuiltJobGraph
 
-A [`StageGraph`](@ref) instantiated by [`plan`](@ref) for a fixed number of
+A [`JobGraph`](@ref) instantiated by [`plan`](@ref) for a fixed number of
 workers, ready for [`run!`](@ref). Holds the tree of graphs with their runtime
-counters, and the per worker scratch `run!` uses, so one `BuiltStageGraph` can
+counters, and the per worker scratch `run!` uses, so one `BuiltJobGraph` can
 be run many times but not concurrently. An empty graph has `nworkers == 0` and
 no worker scratch.
 """
-mutable struct BuiltStageGraph
+mutable struct BuiltJobGraph
     const root::BuiltGraphNode
     const nworkers::Int
     const workers::Vector{WorkerState}
@@ -632,7 +632,7 @@ mutable struct BuiltStageGraph
     # 16 lsb are a count of workers going to sleep or sleeping, 48 msb are the notify counter
     @atomic notify_sleeper::UInt64
     const _pad_after::typeof(CACHE_LINE_PAD)
-    function BuiltStageGraph(root::BuiltGraphNode, nworkers::Int)
+    function BuiltJobGraph(root::BuiltGraphNode, nworkers::Int)
         @assert nworkers > 0
         if isempty(root.children)
             nworkers = 0 # an empty graph has nothing to run, so no workers
@@ -641,38 +641,38 @@ mutable struct BuiltStageGraph
     end
 end
 
-function Base.show(io::IO, g::BuiltStageGraph)
-    print(io, BuiltStageGraph, "(@", repr(objectid(g)), ", ", g.nworkers, " workers)")
+function Base.show(io::IO, g::BuiltJobGraph)
+    print(io, BuiltJobGraph, "(@", repr(objectid(g)), ", ", g.nworkers, " workers)")
 end
 
 """
-    run!(g::BuiltStageGraph)
+    run!(g::BuiltJobGraph)
 
-Run every chunk of every stage as `stage.fun(chunk_idx, info::WorkerInfo)` on
+Run every chunk of every job as `job.fun(chunk_idx, info::WorkerInfo)` on
 `g.nworkers` workers, honoring the `skip_chunks`, and `repeat_if`
 predicates. No chunk
-of a stage starts until every chunk of each stage it deps on, directly or
+of a job starts until every chunk of each job it deps on, directly or
 transitively, has finished, so a chunk can read whatever those chunks produced
 without synchronizing in the `fun`s. A node that deps on a nested graph waits
-for the whole graph, repeats included. Independent ready stages overlap, with
+for the whole graph, repeats included. Independent ready jobs overlap, with
 chunks claimed in roughly declaration order. With one worker everything runs
 in declaration order on the calling task, with no spawns or counters.
 
 A worker with no chunks to work on `yield()` spins, and after a while sleeps
 until another worker makes chunks claimable that it could not take itself,
-so idle workers free their threads during a long stage.
+so idle workers free their threads during a long job.
 
 `fun`s and predicates must be safe to call concurrently with other in flight
 chunks. Per worker scratch must be keyed by `info.worker_idx`. If a `fun` or
 predicate throws the other workers wind down and
-`run!` throws a `StageGraphError` collecting every worker's error. With one
-worker it throws an `ErrorException` naming the stage and chunk, with the
+`run!` throws a `JobGraphError` collecting every worker's error. With one
+worker it throws an `ErrorException` naming the job and chunk, with the
 `fun`'s exception as its cause.
 
 Not reentrant: the counters live in `g`, so don't call `run!` on the same
-`BuiltStageGraph` concurrently.
+`BuiltJobGraph` concurrently.
 """
-function run!(g::BuiltStageGraph)
+function run!(g::BuiltJobGraph)
     if g.nworkers == 0
         return # an empty graph
     end
@@ -693,20 +693,20 @@ function run!(g::BuiltStageGraph)
             Threads.@spawn _run_worker(g, $w)
         end
     end
-    errs = StageGraphWorkerError[w.err for w in g.workers if !isnothing(w.err)]
-    isempty(errs) || throw(StageGraphError(errs))
+    errs = JobGraphWorkerError[w.err for w in g.workers if !isnothing(w.err)]
+    isempty(errs) || throw(JobGraphError(errs))
     nothing
 end
 
 # Single worker: interpret the tree in declaration order on the calling task.
 # This is also the reference semantics for the parallel run.
-function _run_serial!(g::BuiltStageGraph)
+function _run_serial!(g::BuiltJobGraph)
     w = g.workers[1]
     w.at = (g.root, 0, 0)
     try
         _run_serial_graph!(w, g.root)
     catch
-        error("StageGraph run! errored ", _where_string(_at_label(w, g.root), w.at[3]))
+        error("JobGraph run! errored ", _where_string(_at_label(w, g.root), w.at[3]))
     end
     nothing
 end
@@ -717,9 +717,9 @@ function _run_serial_graph!(w::WorkerState, node::BuiltGraphNode)
     while true
         for (i, child) in enumerate(node.children)
             skip = _call_skip_chunks(w, node, i)
-            nchunks = child isa Stage ? child.nchunks : 1 # a nested graph is one chunk
+            nchunks = child isa Job ? child.nchunks : 1 # a nested graph is one chunk
             if skip < nchunks
-                if child isa Stage
+                if child isa Job
                     _run_chunks!(child.fun, w, node, i, skip, child.nchunks)
                 elseif child isa BuiltGraphNode
                     _run_serial_graph!(w, child)
@@ -737,7 +737,7 @@ const MAX_YIELD_SPINS = 1000 # number of yield spins before the worker goes to s
 const ONE_NOTIFY_GEN = UInt64(1)<<16
 
 # Set the exit flag and wake the sleepers.
-function _mark_exit!(g::BuiltStageGraph)
+function _mark_exit!(g::BuiltJobGraph)
     @atomic g.exit = true
     @lock g.sleepers notify(g.sleepers)
 end
@@ -750,19 +750,19 @@ end
 # so the sleeper's final scan sees the publish. If the sleeper's does, the
 # count returned here includes it, and the notify below either changes the
 # generation before the sleeper checks it or wakes the sleeper.
-@inline function _wake_sleeping!(g::BuiltStageGraph)
+@inline function _wake_sleeping!(g::BuiltJobGraph)
     x = @atomic g.notify_sleeper += ONE_NOTIFY_GEN
     if !iszero(x%UInt16)
         _do_notify!(g)
     end
 end
-@noinline function _do_notify!(g::BuiltStageGraph)
+@noinline function _do_notify!(g::BuiltJobGraph)
     @lock g.sleepers notify(g.sleepers)
 end
 
 # A worker scans the tree until the root is done or a worker errors, yielding
 # after a scan that ran nothing.
-function _run_worker(g::BuiltStageGraph, w::WorkerState)
+function _run_worker(g::BuiltJobGraph, w::WorkerState)
     w.at = (g.root, 0, 0)
     try
         yield_count = 0
@@ -805,12 +805,12 @@ function _run_worker(g::BuiltStageGraph, w::WorkerState)
         end
     catch e
         _mark_exit!(g)
-        # w.at attributes an error to its stage and chunk or predicate; the
+        # w.at attributes an error to its job and chunk or predicate; the
         # label distinguishes nodes that share the same fun. Each worker owns
         # its state. The other workers see the flag before their next chunk and
         # wind down without being interrupted: nothing can dep on the throwing
         # chunk.
-        w.err = StageGraphWorkerError(w.info.worker_idx, _at_label(w, g.root), w.at[3], CapturedException(e, catch_backtrace()))
+        w.err = JobGraphWorkerError(w.info.worker_idx, _at_label(w, g.root), w.at[3], CapturedException(e, catch_backtrace()))
     end
     nothing
 end
@@ -819,22 +819,22 @@ end
 # `progress` is true if anything was worked on.
 # `done` is true if the node is done.
 # Scan the children of graph node in declaration order, readying the ready
-# ones, claiming chunks of the claimable stages and descending into the active
+# ones, claiming chunks of the claimable jobs and descending into the active
 # graphs.
-function _scan!(g::BuiltStageGraph, w::WorkerState, node::BuiltGraphNode)
+function _scan!(g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode)
     states = node.states
     progress = false
     for i in node.scan
         (@atomic :monotonic g.exit) && return (progress=true, done=false)
         child = node.children[i]
-        if child isa Stage
+        if child isa Job
             # A plain load only decides what to try; the RMWs below are what
             # actually gate, so a stale value is harmless.
             claimed = @inbounds @atomic :monotonic states[_claim_idx(i)]
             if !(claimed < child.nchunks || claimed == CLAIM_READY)
                 continue
             end
-            # try to do work on the stage.
+            # try to do work on the job.
             # ndone is the number of chunks completed
             ndone = _claim!(child.fun, g, w, node, i, child.nchunks)
             iszero(ndone) && continue
@@ -894,12 +894,12 @@ end
 # claimed as usual and the skipped ones finish with this worker's batch.
 # Function barrier on fun, so the loop dispatches on fun's type once rather
 # than at every chunk
-function _claim!(fun, g::BuiltStageGraph, w::WorkerState, node::BuiltGraphNode, i::Int, nchunks::Int)
+function _claim!(fun, g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode, i::Int, nchunks::Int)
     states = node.states
     ndone = 0
     while !(@atomic :monotonic g.exit)
         # The acquire pairs with the release store of CLAIM_READY or the skip
-        # count by the worker that readied the stage,
+        # count by the worker that readied the job,
         # so the dep chunks' writes are visible before skip_chunks or fun runs.
         chunk_idx = @inbounds @atomic :acquire states[_claim_idx(i)] += 1
         if chunk_idx == CLAIM_READYING # it was CLAIM_READY: elected to ready it
@@ -944,13 +944,13 @@ function _activate!(node::BuiltGraphNode)
 end
 
 # Return the number of work items made available to workers
-# Mark child i of graph node ready, its deps being done: a graph, or a stage
-# with a skip_chunks, for the scan to elect a worker to ready it; a stage
+# Mark child i of graph node ready, its deps being done: a graph, or a job
+# with a skip_chunks, for the scan to elect a worker to ready it; a job
 # without, claimable at once.
 function _publish!(node::BuiltGraphNode, i::Int)::Int
     states = node.states
     child = node.children[i]
-    if child isa Stage && isnothing(node.skip_chunks[i])
+    if child isa Job && isnothing(node.skip_chunks[i])
         @inbounds @atomic :release states[_claim_idx(i)] = 0 # claimable
         child.nchunks
     else
@@ -961,9 +961,9 @@ end
 
 # Return whether graph node is done and not repeating.
 # May return false if another worker errored and set g.exit.
-function _finish!(g::BuiltStageGraph, w::WorkerState, node::BuiltGraphNode, i::Int, n::Int)::Bool
+function _finish!(g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode, i::Int, n::Int)::Bool
     states = node.states
-    # Loop along the chain of on_fin stages
+    # Loop along the chain of on_fin jobs
     while true
         rev_deps = node.rev_deps[i]
         if isempty(rev_deps) # nothing depends on me
@@ -1005,21 +1005,21 @@ function _finish!(g::BuiltStageGraph, w::WorkerState, node::BuiltGraphNode, i::I
                 npublished += _publish!(node, r)
             end
         end
-        # This worker takes one chunk itself: the on_fin stage, run below, or
+        # This worker takes one chunk itself: the on_fin job, run below, or
         # else a published chunk in its scan. Wake before running the on_fin
-        # stage, so sleepers don't wait it out.
+        # job, so sleepers don't wait it out.
         if npublished + !iszero(on_fin) > 1
             _wake_sleeping!(g)
         end
         iszero(on_fin) && return false
         (@atomic :monotonic g.exit) && return false
-        # an on_fin stage has one chunk, so any positive skip skips it
+        # an on_fin job has one chunk, so any positive skip skips it
         if iszero(_call_skip_chunks(w, node, on_fin))
             w.at = (node, on_fin, 1)
             (@atomic :monotonic g.exit) && return false
-            (node.children[on_fin]::Stage).fun(1, w.info)
+            (node.children[on_fin]::Job).fun(1, w.info)
         end
-        # now finish the on_fin stage
+        # now finish the on_fin job
         i, n = on_fin, 1
     end
 end
