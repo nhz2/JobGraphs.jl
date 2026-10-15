@@ -1,0 +1,10 @@
+name = "ParallelPlans"
+uuid = "23b92f99-0e3c-45a2-8e84-2f64f752bbc7"
+version = "0.1.0-dev"
+authors = ["Nathan Zimmerberg <nzimmerberg@gmail.com>"]
+
+[compat]
+julia = "1.12"
+
+[workspace]
+projects = ["test"]
