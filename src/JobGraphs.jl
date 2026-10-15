@@ -1,8 +1,9 @@
 module JobGraphs
 
 export Job, JobGraph, plan, run!
+export WorkerInfo, BuiltJobGraph, JobGraphError, JobGraphWorkerError
 
-# A system for efficient multithreaded programs with mostly static schedules
+# A system for running multithreaded programs with mostly static schedules
 
 #=
 # Order is priority
@@ -28,7 +29,7 @@ bar = JobGraph([
 ]; repeat_if=info->((step+=1) < N))
 
 # TODO add in needed CUDACore.CuEvents if jobs have cuda kernels
-# This likely means marking a job as uses cuda, and padding the CUDACore module to
+# This likely means marking a job as uses cuda, and passing the CUDACore module to
 # plan, so it can use the functions without depending on CUDACore here
 
 my_plan = plan(bar, 16) # 16 workers
