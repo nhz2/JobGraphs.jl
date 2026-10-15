@@ -1,5 +1,5 @@
 [deps]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
-ParallelPlans = "23b92f99-0e3c-45a2-8e84-2f64f752bbc7"
+JobGraphs = "23b92f99-0e3c-45a2-8e84-2f64f752bbc7"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"

@@ -1,9 +1,9 @@
-using ParallelPlans
+using JobGraphs
 using Test
 using Random
 using Aqua: Aqua
 
-Aqua.test_all(ParallelPlans)
+Aqua.test_all(JobGraphs)
 
 # Job funs and predicates the construction and plan tests never call.
 job_fun_a(chunk_idx, info) = nothing
@@ -43,7 +43,7 @@ end
 
 # Throw unless `info` is what a fun or predicate is passed, see WorkerInfo.
 function check_info(ctx::RunCtx, info)
-    info isa ParallelPlans.WorkerInfo || error("expected a WorkerInfo, got a $(typeof(info))")
+    info isa JobGraphs.WorkerInfo || error("expected a WorkerInfo, got a $(typeof(info))")
     info.worker_idx ∈ 1:ctx.nworkers || error("bad worker_idx $(info.worker_idx) with $(ctx.nworkers) workers")
     nothing
 end
@@ -124,13 +124,13 @@ end
 
 # Run plan b on a reset ctx and return the (id, chunk) pairs recorded, sorted,
 # checking no worker overlapped its own chunks.
-function run_chunks(ctx::RunCtx, b::ParallelPlans.BuiltJobGraph)
+function run_chunks(ctx::RunCtx, b::JobGraphs.BuiltJobGraph)
     run_reset!(ctx, b.nworkers)
-    @test isnothing(ParallelPlans.run!(b))
+    @test isnothing(JobGraphs.run!(b))
     @test workers_serial(ctx.events)
     sort!([(e.id, e.chunk) for e in ctx.events])
 end
-run_chunks(ctx::RunCtx, g::ParallelPlans.JobGraph, nw::Int) = run_chunks(ctx, ParallelPlans.plan(g, nw))
+run_chunks(ctx::RunCtx, g::JobGraphs.JobGraph, nw::Int) = run_chunks(ctx, JobGraphs.plan(g, nw))
 
 # The ids of the last run's chunks in start order.
 run_order(ctx::RunCtx) = [e.id for e in sort(ctx.events; by=e -> e.t0)]
@@ -142,36 +142,36 @@ function run_before(ctx::RunCtx, before::Vector{Symbol}, after::Vector{Symbol})
 end
 
 # The exception run! throws for plan b, or nothing. Resets ctx.
-function run_error(ctx::RunCtx, b::ParallelPlans.BuiltJobGraph)
+function run_error(ctx::RunCtx, b::JobGraphs.BuiltJobGraph)
     run_reset!(ctx, b.nworkers)
     try
-        ParallelPlans.run!(b)
+        JobGraphs.run!(b)
         nothing
     catch e
         e
     end
 end
-run_error(ctx::RunCtx, g::ParallelPlans.JobGraph, nw::Int) = run_error(ctx, ParallelPlans.plan(g, nw))
+run_error(ctx::RunCtx, g::JobGraphs.JobGraph, nw::Int) = run_error(ctx, JobGraphs.plan(g, nw))
 
 # Where a parallel run's error says each worker was, like "in job a chunk 1".
 # Through the same function as showerror, which is not called on real errors
 # here as printing backtraces is slow to compile.
-error_wheres(e::ParallelPlans.JobGraphError) = [ParallelPlans._where_string(we.label, we.chunk_idx) for we in e.worker_errors]
+error_wheres(e::JobGraphs.JobGraphError) = [JobGraphs._where_string(we.label, we.chunk_idx) for we in e.worker_errors]
 
 # A predicate of g throws: the error is attributed to it, serially and on NW workers.
-function check_pred_error(ctx::RunCtx, g::ParallelPlans.JobGraph, where::String, NW::Int)
+function check_pred_error(ctx::RunCtx, g::JobGraphs.JobGraph, where::String, NW::Int)
     e = run_error(ctx, g, 1)
     @test e isa ErrorException
     @test occursin(where, e.msg)
     e = run_error(ctx, g, NW)
-    @test e isa ParallelPlans.JobGraphError
+    @test e isa JobGraphs.JobGraphError
     @test error_wheres(e) == [where]
 end
 
 # Check a plan for one worker against one for several from the same
 # declaration: the same tree, with the dep tracking, on_fin marking and
 # counters left out.
-function check_serial_plan(node::ParallelPlans.BuiltGraphNode, ref::ParallelPlans.BuiltGraphNode)
+function check_serial_plan(node::JobGraphs.BuiltGraphNode, ref::JobGraphs.BuiltGraphNode)
     @test node.labels == ref.labels
     @test node.skip_chunks == ref.skip_chunks
     @test node.repeat_if === ref.repeat_if
@@ -179,10 +179,10 @@ function check_serial_plan(node::ParallelPlans.BuiltGraphNode, ref::ParallelPlan
     @test isempty(node.on_fin) && isempty(node.scan) && isempty(node.states)
     @test length(node.children) == length(ref.children)
     for (c, r) in zip(node.children, ref.children)
-        if c isa ParallelPlans.Job
+        if c isa JobGraphs.Job
             @test c === r
         else
-            @test r isa ParallelPlans.BuiltGraphNode
+            @test r isa JobGraphs.BuiltGraphNode
             check_serial_plan(c, r)
         end
     end
@@ -318,7 +318,7 @@ function x_rand_graph!(rng, ctx::XCtx, info::XInfo, id::Int, ancestors::Vector{I
         job = if depth > 0 && rand(rng) < 0.3
             x_rand_graph!(rng, ctx, info, cid, anc, depth - 1)
         else
-            ParallelPlans.Job(XFun(ctx, cid, anc), rand(rng, 0:4))
+            JobGraphs.Job(XFun(ctx, cid, anc), rand(rng, 0:4))
         end
         kind = rand(rng, 0:4)
         props = if iszero(kind)
@@ -330,12 +330,12 @@ function x_rand_graph!(rng, ctx::XCtx, info::XInfo, id::Int, ancestors::Vector{I
         end
         push!(nodes, Symbol(:n, i) => props)
         push!(cids, cid)
-        push!(empties, ParallelPlans._is_job_empty(job))
+        push!(empties, JobGraphs._is_job_empty(job))
     end
     nrepeat = rand(rng, 1:3)
     info.nrepeat[id] = nrepeat
     repeat_if = isone(nrepeat) && rand(rng, Bool) ? nothing : XRepeatIf(ctx, id, nrepeat)
-    ParallelPlans.JobGraph(nodes; repeat_if)
+    JobGraphs.JobGraph(nodes; repeat_if)
 end
 
 # A random root graph with its ctx and info.
@@ -394,7 +394,7 @@ function check_random_runs(rng, ntrials::Int, NW::Int)
     for trial in 1:ntrials
         (g, ctx, info) = x_rand_graph(rng, 3)
         x_reset!(ctx, 1)
-        ParallelPlans.run!(ParallelPlans.plan(g, 1))
+        JobGraphs.run!(JobGraphs.plan(g, 1))
         @test x_ordered(info, ctx)
         @test all(iszero(ctx.iter[id] % info.nrepeat[id]) for id in eachindex(info.nrepeat))
         chunks = x_chunks(ctx)
@@ -402,7 +402,7 @@ function check_random_runs(rng, ntrials::Int, NW::Int)
         calls = copy(ctx.calls)
         for nw in (NW, 2 * Threads.nthreads() + 1)
             x_reset!(ctx, nw)
-            ParallelPlans.run!(ParallelPlans.plan(g, nw))
+            JobGraphs.run!(JobGraphs.plan(g, nw))
             @test x_chunks(ctx) == chunks
             @test ctx.iter == iter
             @test ctx.calls == calls
@@ -412,10 +412,10 @@ function check_random_runs(rng, ntrials::Int, NW::Int)
 end
 
 @testset "Job graph" begin
-    Job = ParallelPlans.Job
-    JobGraph = ParallelPlans.JobGraph
-    plan = ParallelPlans.plan
-    run! = ParallelPlans.run!
+    Job = JobGraphs.Job
+    JobGraph = JobGraphs.JobGraph
+    plan = JobGraphs.plan
+    run! = JobGraphs.run!
     NW = 4
 
     @testset "construction" begin
@@ -439,7 +439,7 @@ end
         @test g.jobs[3] === g.jobs[4] === inner # a graph can be reused
         @test g.deps == [[], [], [2, 1], []] # indices of earlier nodes, decreasing
         # a do_if is normalized to a wrapped skip_chunks
-        @test g.skip_chunks == [nothing, ParallelPlans.DoIfSkip(pred_a), nothing, skip_a]
+        @test g.skip_chunks == [nothing, JobGraphs.DoIfSkip(pred_a), nothing, skip_a]
         @test g.repeat_if === pred_b
         @test isnothing(inner.repeat_if)
 
@@ -541,10 +541,10 @@ end
     @testset "error printing" begin
         # with no backtrace, as printing one is slow to compile
         captured = CapturedException(ErrorException("job fun failed"), Any[])
-        e = ParallelPlans.JobGraphError([
-            ParallelPlans.JobGraphWorkerError(1, [:c, :y], 2, captured),
-            ParallelPlans.JobGraphWorkerError(2, [:a], 0, captured), # skip_chunks, a do_if included
-            ParallelPlans.JobGraphWorkerError(3, Symbol[], -1, captured), # repeat_if of the root
+        e = JobGraphs.JobGraphError([
+            JobGraphs.JobGraphWorkerError(1, [:c, :y], 2, captured),
+            JobGraphs.JobGraphWorkerError(2, [:a], 0, captured), # skip_chunks, a do_if included
+            JobGraphs.JobGraphWorkerError(3, Symbol[], -1, captured), # repeat_if of the root
         ])
         msg = sprint(showerror, e)
         @test occursin("worker 1 in job c.y chunk 2: job fun failed", msg)
@@ -574,10 +574,10 @@ end
         # nested graphs built, one per use
         @test root.labels == [:a, :b, :c, :d, :e]
         @test root.children[1] === g.jobs[1]
-        @test root.children[3] isa ParallelPlans.BuiltGraphNode
+        @test root.children[3] isa JobGraphs.BuiltGraphNode
         @test root.children[3] !== root.children[5]
         @test root.children[3].labels == [:x, :y, :z]
-        @test root.skip_chunks == [nothing, nothing, ParallelPlans.DoIfSkip(pred_b), nothing, nothing]
+        @test root.skip_chunks == [nothing, nothing, JobGraphs.DoIfSkip(pred_b), nothing, nothing]
         @test root.children[3].repeat_if === pred_b
         # rev_deps are the later siblings that dep on a child, counts are in
         # chunks with a nested graph counting as one, and the end children
@@ -585,7 +585,7 @@ end
         @test root.rev_deps == [[2], [3], [4], [], []]
         @test root.total_dep_chunks == [0, 10, 1, 1, 0]
         @test root.total_end_chunks == 2
-        @test length(root.states) == ParallelPlans.JOB_STATE_STRIDE * 7 # a spare stride at each end
+        @test length(root.states) == JobGraphs.JOB_STATE_STRIDE * 7 # a spare stride at each end
         c = root.children[3]
         @test c.rev_deps == [[2], [], []]
         @test c.total_dep_chunks == [0, 2, 0]
@@ -704,7 +704,7 @@ end
             :f => (;skip_chunks=RunSkip(ctx, :f, Returns(1)), job=inner, deps=[:e]), # a graph is one chunk
             :g => (;skip_chunks=RunSkip(ctx, :g, Returns(0)), job=Job(RunFun(ctx, :g), 1), deps=[:f]),
         ])
-        @test ParallelPlans.plan(g, NW).root.on_fin == [false, false, false, false, true, true, false, true]
+        @test JobGraphs.plan(g, NW).root.on_fin == [false, false, false, false, true, true, false, true]
         chunks = [(:a, 1), (:a, 2), (:a, 3), (:b, 3), (:b, 4), (:b, 5), (:c, 1), (:c, 2), (:e, 1), (:g, 1)]
         calls = Dict(:b => 1, :c => 1, :d => 1, :e2 => 1, :e => 1, :f => 1, :g => 1)
         @test run_chunks(ctx, g, 1) == chunks
@@ -784,7 +784,7 @@ end
         @test length(unique(e.worker for e in ctx.events if e.id == :b)) > 1
         # every sleeper signed out, and the generation was bumped once, for :b
         @test iszero((@atomic b.notify_sleeper) % UInt16)
-        @test (@atomic b.notify_sleeper) ÷ ParallelPlans.ONE_NOTIFY_GEN == 1
+        @test (@atomic b.notify_sleeper) ÷ JobGraphs.ONE_NOTIFY_GEN == 1
         # and again, from the reset counters
         @test run_chunks(ctx, b) == chunks
         @test length(unique(e.worker for e in ctx.events if e.id == :b)) > 1
@@ -807,7 +807,7 @@ end
         # in parallel, a JobGraphError with each erroring worker's error,
         # and no chunk starts after the first error
         e = run_error(ctx, g, NW)
-        @test e isa ParallelPlans.JobGraphError
+        @test e isa JobGraphs.JobGraphError
         @test 1 ≤ length(e.worker_errors) ≤ 3
         @test allunique([we.worker_idx for we in e.worker_errors])
         @test all(we.err.ex == ErrorException("boom") for we in e.worker_errors)
@@ -846,7 +846,7 @@ end
             :b => (;job=Job(RunFun(ctx, :b), 2), deps=[:a]),
         ])
         b = plan(g, NW)
-        @test run_error(ctx, b) isa ParallelPlans.JobGraphError
+        @test run_error(ctx, b) isa JobGraphs.JobGraphError
         flag[] = false
         @test run_chunks(ctx, b) == [(:b, 1), (:b, 2)]
     end

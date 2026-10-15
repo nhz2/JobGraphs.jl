@@ -1,4 +1,4 @@
-module ParallelPlans
+module JobGraphs
 
 export Job, JobGraph, plan, run!
 
@@ -1026,4 +1026,4 @@ function _finish!(g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode, i::Int
     end
 end
 
-end # module ParallelPlans
+end # module JobGraphs

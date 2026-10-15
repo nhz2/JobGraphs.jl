@@ -1,12 +1,11 @@
-# ParallelPlans.jl
+# JobGraphs.jl
 
-[![CI](https://github.com/nhz2/ParallelPlans.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/nhz2/ParallelPlans.jl/actions/workflows/CI.yml)
+[![CI](https://github.com/nhz2/JobGraphs.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/nhz2/JobGraphs.jl/actions/workflows/CI.yml)
 
 A Julia package to help plan multi-threaded work.
 
 You describe your work up front as a graph of chunked jobs and their dependencies.
-ParallelPlans then runs it on a fixed set of workers. The workers claim chunks with
-atomic counters, so there is no task spawned per chunk.
+JobGraphs then runs it on a fixed set of worker threads.
 A job starts as soon as the jobs it depends on finish, and independent jobs overlap.
 
 It works best for programs whose schedule is mostly the same on every run, such as the
@@ -18,7 +17,7 @@ The package is not registered yet. It requires Julia 1.12 or later.
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/nhz2/ParallelPlans.jl")
+Pkg.add(url="https://github.com/nhz2/JobGraphs.jl")
 ```
 
 Start Julia with several threads, for example `julia --threads=auto`. Otherwise
@@ -30,7 +29,7 @@ This example also uses [ChunkSplitters.jl](https://github.com/JuliaFolds2/ChunkS
 to split the input into chunks.
 
 ```julia
-using ParallelPlans
+using JobGraphs
 using ChunkSplitters: chunks
 
 x = randn(1_000_000)
@@ -170,7 +169,7 @@ outer = JobGraph([
 
 Thanks to my advisor, Dr. Garegin Papoian, for helpful discussions.
 
-ParallelPlans was inspired by:
+JobGraphs was inspired by:
 
 - [Dagger.jl](https://github.com/JuliaParallel/Dagger.jl)
 - [ChunkSplitters.jl](https://github.com/JuliaFolds2/ChunkSplitters.jl)
