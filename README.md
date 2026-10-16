@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/nhz2/JobGraphs.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/nhz2/JobGraphs.jl/actions/workflows/CI.yml)
 
-A Julia package to help plan multi-threaded work.
+A Julia package to plan and run multi-threaded work.
 
 You describe your work up front as a graph of chunked jobs and their dependencies.
 JobGraphs then runs it on a fixed set of worker threads.
