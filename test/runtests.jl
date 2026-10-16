@@ -195,7 +195,7 @@ function check_serial_plan(node::JobGraphs.BuiltGraphNode, ref::JobGraphs.BuiltG
     @test node.skip_chunks == ref.skip_chunks
     @test node.repeat_if === ref.repeat_if
     @test isempty(node.rev_deps) && isempty(node.total_dep_chunks) && iszero(node.total_end_chunks)
-    @test isempty(node.on_fin) && isempty(node.scan) && isempty(node.resources) && isempty(node.states)
+    @test isempty(node.on_fin) && isempty(node.on_fin_rev_dep) && isempty(node.scan) && isempty(node.resources) && isempty(node.states)
     @test length(node.children) == length(ref.children)
     for (c, r) in zip(node.children, ref.children)
         if c isa JobGraphs.Job
@@ -625,8 +625,10 @@ end
         # their last dep chunk, and not scanned
         @test root.on_fin == [false, true, false, true, false]
         @test root.scan == [1, 3, 5]
+        @test root.on_fin_rev_dep == [2, 0, 4, 0, 0]
         @test c.on_fin == [false, true, false]
         @test c.scan == [1, 3]
+        @test c.on_fin_rev_dep == [2, 0, 0]
         # but a child gets at most one on_fin rev dep
         b2 = plan(JobGraph([
             :a => (;job=Job(job_fun_a, 2)),
@@ -636,6 +638,7 @@ end
         ]), 2)
         @test b2.root.on_fin == [false, true, false, true]
         @test b2.root.scan == [1, 3]
+        @test b2.root.on_fin_rev_dep == [2, 4, 4, 0]
         # one worker keeps only what the serial run needs
         check_serial_plan(plan(g, 1).root, root)
         # an empty graph plans to a root with no children, and no workers
@@ -851,6 +854,7 @@ end
         @test b.root.resources == [[(mem, 3)], [], [(mem, 1)], [(mem, 1)], [(gpu, 1)], [], [(mem, 2), (gpu, 1)], [(mem, 1)], [(mem, 1)]]
         @test b.root.children[2].resources == [[(gpu, 2)]]
         @test b.root.on_fin == [false, false, true, false, false, true, false, false, true]
+        @test b.root.on_fin_rev_dep == [3, 0, 0, 0, 6, 0, 9, 9, 0]
         @test b.root.fin_release == [[(mem, 2)], [], [], [], [(gpu, 1)], [], [(mem, 1), (gpu, 1)], [], []]
         # a pruned job needs nothing
         @test plan(JobGraph([:a => (;job=Job(job_fun_a, 0; resources=(;gpu=1)))]), NW) isa JobGraphs.BuiltJobGraph

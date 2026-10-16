@@ -436,9 +436,11 @@ mutable struct BuiltGraphNode
     const repeat_if::Any # nothing, or the repeat_if predicate
     # on_fin: per child, whether it is a single chunk job run by the worker
     # that finishes its last dep chunk, rather than marked ready for scanning.
-    # Each child has at most one on_fin rev dep.
     const on_fin::Vector{Bool}
     const scan::Vector{Int} # the children scanning workers look at: those not on_fin
+    # per child: the index of its on_fin rev dep, of which it has at most one,
+    # or 0 without one
+    const on_fin_rev_dep::Vector{Int}
     # per child: the resources a job holds while claiming, as (index in
     # BuiltJobGraph.resources, amount), see _resource_idx; empty for graphs
     const resources::Vector{Vector{Tuple{Int, Int64}}}
@@ -465,7 +467,7 @@ function _build(g::JobGraph, nworkers::Int, res_idxs::Dict{Symbol, Int})
         return BuiltGraphNode(
             copy(g.labels), children,
             Vector{Int}[], Int64[], Int64(0), copy(g.skip_chunks), g.repeat_if,
-            Bool[], Int[], Vector{Tuple{Int, Int64}}[], Vector{Tuple{Int, Int64}}[], AtomicMemory{Int64}(undef, 0),
+            Bool[], Int[], Int[], Vector{Tuple{Int, Int64}}[], Vector{Tuple{Int, Int64}}[], AtomicMemory{Int64}(undef, 0),
         )
     end
     resources = [
@@ -493,16 +495,16 @@ function _build(g::JobGraph, nworkers::Int, res_idxs::Dict{Symbol, Int})
     # on_fin rev dep per child, and only jobs whose resources each dep
     # holds, a graph holding none.
     on_fin = fill(false, n)
+    on_fin_rev_dep = zeros(Int, n)
     fin_release = [Tuple{Int, Int64}[] for _ in 1:n]
-    has_onfin_rev_dep = fill(false, n)
     for i in 1:n
         s = g.jobs[i]
         deps = g.deps[i]
-        if s isa Job && isone(s.nchunks) && !isempty(deps) && !any(d -> has_onfin_rev_dep[d], deps) &&
+        if s isa Job && isone(s.nchunks) && !isempty(deps) && all(d -> iszero(on_fin_rev_dep[d]), deps) &&
                 all(d -> _holds(resources[d], resources[i]), deps)
             on_fin[i] = true
             for d in deps
-                has_onfin_rev_dep[d] = true
+                on_fin_rev_dep[d] = i
                 fin_release[d] = _resource_diff(resources[d], resources[i])
             end
         end
@@ -514,7 +516,7 @@ function _build(g::JobGraph, nworkers::Int, res_idxs::Dict{Symbol, Int})
     BuiltGraphNode(
         copy(g.labels), children,
         rev_deps, total_dep_chunks, total_end_chunks, copy(g.skip_chunks), g.repeat_if,
-        on_fin, findall(!, on_fin), resources, fin_release, states,
+        on_fin, findall(!, on_fin), on_fin_rev_dep, resources, fin_release, states,
     )
 end
 
@@ -1174,28 +1176,33 @@ function _finish!(g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode, i::Int
                 return true
             end
         end
+        # Release publishes everything this worker has seen of child i and
+        # its deps; acquire gets the same from the other deps' finishers.
+        # A negative count means a chunk was finished twice.
+        # First decide whether this worker runs child i's on_fin rev dep, so
+        # it can put back the resources before publishing the others.
+        f = node.on_fin_rev_dep[i]
         on_fin = 0
-        npublished = 0
-        for r in rev_deps
-            # Release publishes everything this worker has seen of child i and
-            # its deps; acquire gets the same from the other deps' finishers.
-            left = @inbounds @atomic :acquire_release states[_ready_idx(r)] -= n
-            @assert left ≥ 0 # a double finish would step over 0
-            if !iszero(left)
-                continue
-            end
-            if node.on_fin[r]
-                # Run below by this worker
-                @assert iszero(on_fin)
-                on_fin = r
-            else
-                npublished += _publish!(node, r)
+        if !iszero(f)
+            left = @inbounds @atomic :acquire_release states[_ready_idx(f)] -= n
+            @assert left ≥ 0
+            if iszero(left) # run below by this worker
+                on_fin = f
             end
         end
-        # Put back child i's resources, or with an on_fin job to run, the
+        # Put back child i's resources, or with the on_fin job to run, the
         # part of them it doesn't need.
         put_back = iszero(on_fin) ? node.resources[i] : node.fin_release[i]
         _release!(g, put_back)
+        npublished = 0
+        for r in rev_deps
+            r == f && continue
+            left = @inbounds @atomic :acquire_release states[_ready_idx(r)] -= n
+            @assert left ≥ 0
+            if iszero(left)
+                npublished += _publish!(node, r)
+            end
+        end
         # This worker takes one chunk itself: the on_fin job, run below, or
         # else a published chunk in its scan. Wake before running the on_fin
         # job, so sleepers don't wait it out.
