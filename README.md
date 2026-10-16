@@ -1,4 +1,4 @@
-# JobGraphs.jl
+# JobGraphs.jl (WIP)
 
 [![CI](https://github.com/nhz2/JobGraphs.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/nhz2/JobGraphs.jl/actions/workflows/CI.yml)
 
