@@ -79,6 +79,25 @@ function (f::SlowFun)(chunk_idx, info)
     f.f(chunk_idx, info)
 end
 
+# A job fun that runs `f` while counting `amount` of each of its resources as
+# in use in `used`, keeping the most ever in use at once in `peak`.
+struct ResFun
+    f::Any
+    used::Dict{Symbol, Threads.Atomic{Int}}
+    peak::Dict{Symbol, Threads.Atomic{Int}}
+    resources::NamedTuple
+end
+function (f::ResFun)(chunk_idx, info)
+    for (name, amount) in pairs(f.resources)
+        Threads.atomic_max!(f.peak[name], Threads.atomic_add!(f.used[name], amount) + amount)
+    end
+    f.f(chunk_idx, info)
+    for (name, amount) in pairs(f.resources)
+        Threads.atomic_sub!(f.used[name], amount)
+    end
+    nothing
+end
+
 # A predicate that counts its calls as `id` and returns f(ncalls).
 struct RunPred
     ctx::RunCtx
@@ -176,7 +195,7 @@ function check_serial_plan(node::JobGraphs.BuiltGraphNode, ref::JobGraphs.BuiltG
     @test node.skip_chunks == ref.skip_chunks
     @test node.repeat_if === ref.repeat_if
     @test isempty(node.rev_deps) && isempty(node.total_dep_chunks) && iszero(node.total_end_chunks)
-    @test isempty(node.on_fin) && isempty(node.scan) && isempty(node.states)
+    @test isempty(node.on_fin) && isempty(node.scan) && isempty(node.resources) && isempty(node.states)
     @test length(node.children) == length(ref.children)
     for (c, r) in zip(node.children, ref.children)
         if c isa JobGraphs.Job
@@ -426,6 +445,9 @@ end
         @test Job(job_fun_a, 0).nchunks == 0
         @test_throws ArgumentError Job(job_fun_a, -1)
         @test_throws ArgumentError Job(job_fun_a, 2^30)
+        # resources are kept as declared, without the zero amounts
+        @test isempty(s.resources)
+        @test Job(job_fun_a, 2; resources=(;y=2, x=0, z=UInt8(1))).resources == [:y => 2, :z => 1]
 
         inner = JobGraph([:x => (;job=Job(job_fun_b, 1))])
         g = JobGraph([
@@ -511,6 +533,13 @@ end
         @test_throws ArgumentError JobGraph(Any[:a => (;job=Job(job_fun_a, 0), deps=[:a])]) # even if pruned
         @test_throws ArgumentError JobGraph(Any[:a => (;job=S, deps=[:b]), :b => (;job=S)]) # dep on a later node
         @test_throws ArgumentError plan(JobGraph(Any[:a => (;job=S)]), 0)
+        # resources are a NamedTuple of non-negative Int64s
+        @test_throws ArgumentError Job(job_fun_a, 1; resources=[:x => 1])
+        @test_throws ArgumentError Job(job_fun_a, 1; resources=(;x=-1))
+        @test_throws ArgumentError Job(job_fun_a, 1; resources=(;x=1.0))
+        @test_throws ArgumentError Job(job_fun_a, 1; resources=(;x=typemax(UInt64)))
+        @test_throws ArgumentError plan(JobGraph(Any[:a => (;job=S)]), 2; resources=(;x=-1))
+        @test_throws ArgumentError plan(JobGraph(Any[:a => (;job=S)]), 2; resources=Dict(:x => 1))
     end
 
     @testset "printing" begin
@@ -534,6 +563,7 @@ end
         big = zeros(1000)
         s = repr(JobGraph([:a => (;do_if=info -> isempty(big), job=Job((chunk_idx, info) -> sum(big), 1))]))
         @test length(s) < 200 && !occursin("0.0", s)
+        @test occursin(r"Job\((Main\.)?job_fun_a, 3; resources=\(;y=2, z=1\)\)", repr(Job(job_fun_a, 3; resources=(;y=2, x=0, z=1))))
         @test count("JobGraph([", repr(MIME("text/plain"), g)) == 2
         @test occursin(r"BuiltJobGraph\(@0x[0-9a-f]+, 2 workers\)", repr(plan(g, 2)))
     end
@@ -788,6 +818,112 @@ end
         # and again, from the reset counters
         @test run_chunks(ctx, b) == chunks
         @test length(unique(e.worker for e in ctx.events if e.id == :b)) > 1
+    end
+
+    @testset "resources" begin
+        S = Job(job_fun_a, 1)
+        # every job must need only resources given to plan, and no more than
+        # their capacity, else it could never run; nested jobs are named by
+        # their path
+        inner = JobGraph([:x => (;job=Job(job_fun_a, 2; resources=(;gpu=2)))])
+        # A single chunk job with resources is on_fin only if each of its
+        # deps holds them, its finisher keeping them for it and putting back
+        # the rest.
+        g = JobGraph([
+            :a => (;job=Job(job_fun_a, 2; resources=(;mem=3))),
+            :b => (;job=inner, deps=[:a]),
+            :c => (;job=Job(job_fun_a, 1; resources=(;mem=1)), deps=[:a]), # keeps 1 of :a's mem
+            :d => (;job=Job(job_fun_a, 1; resources=(;mem=1)), deps=[:b]), # a graph holds nothing
+            :e => (;job=Job(job_fun_a, 1; resources=(;gpu=1)), deps=[:c]), # :c holds no gpu
+            :f => (;job=Job(job_fun_a, 1), deps=[:e]), # keeps nothing
+            :p => (;job=Job(job_fun_a, 2; resources=(;mem=2, gpu=1))),
+            :q => (;job=Job(job_fun_a, 2; resources=(;mem=1))),
+            :r => (;job=Job(job_fun_a, 1; resources=(;mem=1)), deps=[:p, :q]), # held by both
+        ])
+        for nw in (1, NW)
+            @test_throws "job a needs resource :mem, which plan was not given" plan(g, nw; resources=(;gpu=2))
+            @test_throws "job b.x needs 2 of resource :gpu, more than its capacity 1" plan(g, nw; resources=(;mem=3, gpu=1))
+        end
+        @test_throws "job a needs resource :mem, which plan was not given" plan(g, NW; resources=(;gpu=2, mem=0))
+        b = plan(g, NW; resources=(;gpu=2, mem=3, unused=0))
+        @test b.capacity == [2, 3] # zero capacities are dropped
+        gpu, mem = JobGraphs._resource_idx(1), JobGraphs._resource_idx(2)
+        @test b.root.resources == [[(mem, 3)], [], [(mem, 1)], [(mem, 1)], [(gpu, 1)], [], [(mem, 2), (gpu, 1)], [(mem, 1)], [(mem, 1)]]
+        @test b.root.children[2].resources == [[(gpu, 2)]]
+        @test b.root.on_fin == [false, false, true, false, false, true, false, false, true]
+        @test b.root.fin_release == [[(mem, 2)], [], [], [], [(gpu, 1)], [], [(mem, 1), (gpu, 1)], [], []]
+        # a pruned job needs nothing
+        @test plan(JobGraph([:a => (;job=Job(job_fun_a, 0; resources=(;gpu=1)))]), NW) isa JobGraphs.BuiltJobGraph
+
+        # The chunks running at once never hold more than a resource's
+        # capacity, across jobs, nested graphs and repeats.
+        ctx = RunCtx()
+        caps = (;x=3, y=2)
+        used = Dict(name => Threads.Atomic{Int}(0) for name in keys(caps))
+        peak = Dict(name => Threads.Atomic{Int}(0) for name in keys(caps))
+        rjob(id, n, resources) = Job(ResFun(RunFun(ctx, id), used, peak, resources), n; resources)
+        inner = JobGraph([
+            :x => (;job=rjob(:x, 6, (;x=1, y=1))),
+            :y => (;job=rjob(:y, 1, (;y=2)), deps=[:x]),
+        ]; repeat_if=RunPred(ctx, :inner, n -> n < 3))
+        g = JobGraph([
+            :a => (;job=rjob(:a, 20, (;x=1))),
+            :b => (;job=rjob(:b, 20, (;x=2, y=1))),
+            :c => (;job=rjob(:c, 10, (;y=2))),
+            :d => (;job=rjob(:d, 5, (;x=3))),
+            :e => (;job=Job(RunFun(ctx, :e), 10)),
+            :f => (;job=rjob(:f, 1, (;x=1)), deps=[:a]), # on_fin
+            :g => (;job=inner, deps=[:f]),
+            :h => (;job=rjob(:h, 1, (;x=1, y=1)), deps=[:b]), # on_fin
+            :i => (;job=rjob(:i, 1, (;y=1)), deps=[:h]), # on_fin
+        ])
+        @test plan(g, NW; resources=caps).root.on_fin == [false, false, false, false, false, true, false, true, true]
+        chunks = run_chunks(ctx, plan(g, 1; resources=caps))
+        for nw in (NW, 2 * Threads.nthreads() + 1)
+            b = plan(g, nw; resources=caps)
+            for _ in 1:20
+                @test run_chunks(ctx, b) == chunks
+                @test ctx.calls == Dict(:inner => 3)
+                @test run_before(ctx, [:a], [:f])
+                @test run_before(ctx, [:f], [:x])
+                @test run_before(ctx, [:b], [:h])
+                @test run_before(ctx, [:h], [:i])
+            end
+            @test peak[:x][] ≤ 3
+            @test peak[:y][] ≤ 2
+            @test all(iszero(u[]) for u in values(used))
+        end
+
+        # A resource of capacity 1 is a lock, across jobs, ordering the
+        # chunks' writes.
+        nbumps = Ref(0)
+        bump = Job(1000; resources=(;lock=1)) do chunk_idx, info
+            nbumps[] += 1
+            nothing
+        end
+        g = JobGraph([:a => (;job=bump), :b => (;job=bump), :c => (;job=bump)])
+        b = plan(g, NW; resources=(;lock=1))
+        for _ in 1:10
+            nbumps[] = 0
+            run!(b)
+            @test nbumps[] == 3000
+        end
+
+        # While :a's one chunk holds the gpu, the other workers can't run :b
+        # and sleep. :a's finisher then runs its on_fin :c, which needs no
+        # gpu, but first, releasing the gpu, wakes them to run :b meanwhile.
+        g = JobGraph([
+            :a => (;job=Job(SlowFun(RunFun(ctx, :a), 0.05), 1; resources=(;gpu=1))),
+            :b => (;job=Job(RunFun(ctx, :b), 4; resources=(;gpu=1))),
+            :c => (;job=Job(SlowFun(RunFun(ctx, :c), 0.2), 1), deps=[:a]),
+        ])
+        b = plan(g, NW; resources=(;gpu=1))
+        @test b.root.on_fin == [false, false, true]
+        @test run_chunks(ctx, b) == [(:a, 1), (:b, 1), (:b, 2), (:b, 3), (:b, 4), (:c, 1)]
+        @test run_before(ctx, [:a], [:b, :c])
+        c = only(e for e in ctx.events if e.id == :c)
+        @test all(e.t1 < c.t1 && e.worker != c.worker for e in ctx.events if e.id == :b)
+        @test iszero((@atomic b.notify_sleeper) % UInt16)
     end
 
     @testset "errors" begin

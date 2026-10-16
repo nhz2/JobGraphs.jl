@@ -67,7 +67,8 @@ There are three steps:
 
 1. **Declare** a `JobGraph`: a list of labeled nodes, each a `Job` (or a nested
    `JobGraph`) with optional dependencies and predicates.
-2. **Plan** it with `plan(g, nworkers)`.
+2. **Plan** it with `plan(g, nworkers)`, giving the capacity of any
+   [resources](#resources) the jobs need.
 3. **Run** it with `run!(p)`. You can run a plan many times, but not concurrently.
 
 ## Concepts
@@ -135,6 +136,27 @@ outer = JobGraph([
 ])
 ```
 
+### Resources
+
+Resources limit how many chunks run at once across jobs. For example, they can
+keep the memory the jobs use within a budget or limit the number of concurrent
+downloads. Name the capacity of each resource when planning, and how much of
+each one every chunk of a job holds while it runs:
+
+```julia
+g = JobGraph([
+    :fetch => (; job=Job(download!, 100; resources=(; net=1))),
+    :small => (; job=Job(small!, 100; resources=(; mem=1))),
+    :big   => (; job=Job(big!, 10; resources=(; mem=4, net=1))),
+    :log   => (; job=Job(append_log!, 20; resources=(; log=1))),
+])
+p = plan(g, nworkers; resources=(; net=4, mem=8, log=1))
+```
+
+Here at most 4 chunks download at the same time and at most 8 units of memory are used at the same time.
+
+A worker waiting for a resource runs other ready work instead of blocking.
+
 ## Rules for job functions and predicates
 
 - They must be safe to call at the same time as other chunks that are running.
@@ -159,7 +181,11 @@ outer = JobGraph([
 - With `nworkers == 1`, `run!` simply runs everything in declaration order on the
   calling task.
 - A single-chunk job with dependencies, such as a reduction, is run directly by the
-  worker that finishes its last dependency.
+  worker that finishes its last dependency. If it needs resources, this happens
+  only when every dependency needs at least as much of each, so that worker can
+  keep what the job needs instead of waiting.
+- A worker takes a job's resources once and keeps them while it claims chunks of
+  that job. Jobs without resources pay nothing extra.
 - Idle workers spin with `yield()` for a while, then sleep until more work is
   published. This frees their threads during a long serial job.
 - Callable structs work well as job functions. They avoid boxed captured variables

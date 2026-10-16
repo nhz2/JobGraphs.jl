@@ -54,13 +54,17 @@ mutable struct WorkerInfo
 end
 
 """
-    Job(fun, nchunks::Int)
+    Job(fun, nchunks::Int; resources=(;))
 
 The leaf in a [`JobGraph`](@ref) tree.
 
 `fun(chunk_idx::Int, info::WorkerInfo) -> nothing` is run in parallel across
 `nchunks`. `chunk_idx` is in `1:nchunks` and `info` describes the calling
 worker, see [`WorkerInfo`](@ref). Capture input and output in `fun`.
+
+`resources`, a `NamedTuple` like `(;mem=4, net=1)`, is how much of each named
+resource every chunk of the job holds while it runs, out of the capacities
+given to [`plan`](@ref).
 
 A `Job` with zero chunks is pruned from any [`JobGraph`](@ref) it is put in.
 
@@ -69,13 +73,31 @@ Per worker scratch must be keyed by `info.worker_idx`.
 struct Job
     fun::Any
     nchunks::Int
-    Base.@nospecializeinfer function Job(fun::Any, nchunks::Int)
+    resources::Vector{Pair{Symbol, Int64}} # name => amount, as declared, without zeros
+    Base.@nospecializeinfer function Job(fun::Any, nchunks::Int; resources=(;))
         @nospecialize
         if nchunks < 0 || nchunks ≥ 2^30
             throw(ArgumentError("nchunks must be in 0:$(2^30 - 1)"))
         end
-        new(fun, nchunks)
+        new(fun, nchunks, _resource_pairs(resources, "Job resources"))
     end
+end
+
+# Return a resources NamedTuple as name => amount pairs, checking the amounts
+# and dropping the zeros, which need or offer nothing.
+Base.@nospecializeinfer function _resource_pairs(resources, what::String)
+    @nospecialize resources
+    if !(resources isa NamedTuple)
+        throw(ArgumentError("$what must be a NamedTuple like (;mem=1), got a $(typeof(resources))"))
+    end
+    out = Pair{Symbol, Int64}[]
+    for (name, amount) in pairs(resources)
+        if !(amount isa Integer && 0 ≤ amount ≤ typemax(Int64))
+            throw(ArgumentError("$what: $name must be a non-negative Int64, got $(repr(amount))"))
+        end
+        iszero(amount) || push!(out, name => Int64(amount))
+    end
+    out
 end
 
 # A do_if predicate normalized to the skip_chunks convention: skip nothing on
@@ -253,7 +275,13 @@ end
 function Base.show(io::IO, s::Job)
     print(io, Job, "(")
     _show_callable(io, s.fun)
-    print(io, ", ", s.nchunks, ")")
+    print(io, ", ", s.nchunks)
+    if !isempty(s.resources)
+        print(io, "; resources=(;")
+        join(io, ("$name=$amount" for (name, amount) in s.resources), ", ")
+        print(io, ")")
+    end
+    print(io, ")")
 end
 
 # Both show methods print the declaration the graph came from, with the deps the
@@ -335,6 +363,14 @@ end
 # soft priority. Single chunk jobs marked on_fin at build time are never
 # scanned: the worker that finishes their last dep chunk runs them itself.
 #
+# A job with resources is claimed only by a worker holding them: it takes all
+# of them, without waiting, before claiming the job's chunks, carries them
+# while it claims until the job is exhausted, then puts them back, see
+# _acquire!. Workers never wait holding resources, so they can't deadlock. A
+# release wakes the sleepers, which may have slept for want of the resources.
+# A job with resources is on_fin only if each of its deps holds at least as
+# much of each of them.
+#
 # Each BuiltGraphNode owns the runtime counters of its children in one
 # AtomicMemory{Int64}: a done counter for the graph, then a ready counter and a
 # claim counter per child, at a stride of one cache line so children don't
@@ -403,6 +439,12 @@ mutable struct BuiltGraphNode
     # Each child has at most one on_fin rev dep.
     const on_fin::Vector{Bool}
     const scan::Vector{Int} # the children scanning workers look at: those not on_fin
+    # per child: the resources a job holds while claiming, as (index in
+    # BuiltJobGraph.resources, amount), see _resource_idx; empty for graphs
+    const resources::Vector{Vector{Tuple{Int, Int64}}}
+    # per child: the part of its resources its finisher puts back before
+    # running its on_fin rev dep, keeping the rest for it; empty without one
+    const fin_release::Vector{Vector{Tuple{Int, Int64}}}
     const states::AtomicMemory{Int64} # JOB_STATE_STRIDE*(length(children)+2) Int64s, see _done_idx, _ready_idx and _claim_idx
 end
 
@@ -411,18 +453,25 @@ function Base.show(io::IO, node::BuiltGraphNode)
 end
 
 # Return the BuiltGraphNode for g.
-# Its nested graphs are built recursively.
-function _build(g::JobGraph, nworkers::Int)
+# Its nested graphs are built recursively. res_idxs maps each resource name to
+# its index in BuiltJobGraph.resources.
+function _build(g::JobGraph, nworkers::Int, res_idxs::Dict{Symbol, Int})
     n = length(g.labels)
+    children = Union{BuiltGraphNode, Job}[s isa Job ? s : _build(s, nworkers, res_idxs) for s in g.jobs]
     if isone(nworkers) || iszero(n)
-        # The dependency tracking isn't needed. Only the root can be empty,
+        # The dependency tracking isn't needed, nor are resources, as one
+        # worker can't exceed them. Only the root can be empty,
         # empty nested graphs having been pruned, and run! does nothing for it.
         return BuiltGraphNode(
-            copy(g.labels), Union{BuiltGraphNode, Job}[s isa Job ? s : _build(s, nworkers) for s in g.jobs],
+            copy(g.labels), children,
             Vector{Int}[], Int64[], Int64(0), copy(g.skip_chunks), g.repeat_if,
-            Bool[], Int[], AtomicMemory{Int64}(undef, 0),
+            Bool[], Int[], Vector{Tuple{Int, Int64}}[], Vector{Tuple{Int, Int64}}[], AtomicMemory{Int64}(undef, 0),
         )
     end
+    resources = [
+        s isa Job ? Tuple{Int, Int64}[(res_idxs[name], amount) for (name, amount) in s.resources] : Tuple{Int, Int64}[]
+        for s in g.jobs
+    ]
     nchunks = [s isa Job ? s.nchunks : 1 for s in g.jobs]
     rev_deps = [Int[] for _ in 1:n]
     total_dep_chunks = zeros(Int64, n)
@@ -441,16 +490,20 @@ function _build(g::JobGraph, nworkers::Int)
     end
     @assert !iszero(total_end_chunks)
     # Greedily mark on_fin jobs in declaration order, keeping at most one
-    # on_fin rev dep per child.
+    # on_fin rev dep per child, and only jobs whose resources each dep
+    # holds, a graph holding none.
     on_fin = fill(false, n)
+    fin_release = [Tuple{Int, Int64}[] for _ in 1:n]
     has_onfin_rev_dep = fill(false, n)
     for i in 1:n
         s = g.jobs[i]
         deps = g.deps[i]
-        if s isa Job && isone(s.nchunks) && !isempty(deps) && !any(d -> has_onfin_rev_dep[d], deps)
+        if s isa Job && isone(s.nchunks) && !isempty(deps) && !any(d -> has_onfin_rev_dep[d], deps) &&
+                all(d -> _holds(resources[d], resources[i]), deps)
             on_fin[i] = true
             for d in deps
                 has_onfin_rev_dep[d] = true
+                fin_release[d] = _resource_diff(resources[d], resources[i])
             end
         end
     end
@@ -459,16 +512,61 @@ function _build(g::JobGraph, nworkers::Int)
         @atomic :monotonic states[i] = CLAIM_NOT_READY # nothing to do until activated
     end
     BuiltGraphNode(
-        copy(g.labels), Union{BuiltGraphNode, Job}[s isa Job ? s : _build(s, nworkers) for s in g.jobs],
+        copy(g.labels), children,
         rev_deps, total_dep_chunks, total_end_chunks, copy(g.skip_chunks), g.repeat_if,
-        on_fin, findall(!, on_fin), states,
+        on_fin, findall(!, on_fin), resources, fin_release, states,
     )
 end
 
+# Return the amount of resource r in res, as (index, amount) pairs.
+_amount(res::Vector{Tuple{Int, Int64}}, r::Int) = sum((amount for (r2, amount) in res if r2 == r); init=Int64(0))
+
+# Return whether res holds at least as much of each resource as need.
+_holds(res::Vector{Tuple{Int, Int64}}, need::Vector{Tuple{Int, Int64}}) = all(amount ≤ _amount(res, r) for (r, amount) in need)
+
+# Return what is left of res after taking need, which it holds, without zeros.
+function _resource_diff(res::Vector{Tuple{Int, Int64}}, need::Vector{Tuple{Int, Int64}})
+    left = Tuple{Int, Int64}[]
+    for (r, amount) in res
+        rest = amount - _amount(need, r)
+        if rest > 0
+            push!(left, (r, rest))
+        end
+    end
+    left
+end
+
+# Throw unless every job of g, at label path, needs only resources in
+# capacity, and no more of each than its capacity, so it can run.
+function _check_resources(g::JobGraph, capacity::Dict{Symbol, Int64}, path::Vector{Symbol})
+    for (label, s) in zip(g.labels, g.jobs)
+        push!(path, label)
+        if s isa Job
+            for (name, amount) in s.resources
+                cap = get(capacity, name, nothing)
+                if isnothing(cap)
+                    throw(ArgumentError("job $(join(path, '.')) needs resource $(repr(name)), which plan was not given"))
+                end
+                if amount > cap
+                    throw(ArgumentError("job $(join(path, '.')) needs $amount of resource $(repr(name)), more than its capacity $cap"))
+                end
+            end
+        else
+            _check_resources(s, capacity, path)
+        end
+        pop!(path)
+    end
+    nothing
+end
+
 """
-    plan(g::JobGraph, nworkers::Int; compile=true)::BuiltJobGraph
+    plan(g::JobGraph, nworkers::Int; compile=true, resources=(;))::BuiltJobGraph
 
 Plan `g` for [`run!`](@ref) on `nworkers` workers.
+
+`resources`, a `NamedTuple` like `(;mem=8, net=4)`, is the capacity of each
+named resource the jobs of `g` need, see [`Job`](@ref). It is an error for a
+job to need a resource not given here, or more than its capacity.
 
 With more than one worker and `compile`, every `fun` and predicate of `g` is
 compiled here, so the first `run!` does not compile them in a worker while
@@ -478,14 +576,17 @@ lookup of about a microsecond per job once they are compiled, so pass
 
 The returned object cannot be `run!` concurrently.
 """
-function plan(g::JobGraph, nworkers::Int; compile::Bool=true)
+function plan(g::JobGraph, nworkers::Int; compile::Bool=true, resources=(;))
     if nworkers ≤ 0
         throw(ArgumentError("nworkers must be positive"))
     end
     if nworkers ≥ 2^16
         throw(ArgumentError("nworkers must be less than 2^16. Got $(nworkers)"))
     end
-    built = BuiltJobGraph(_build(g, nworkers), nworkers)
+    res_pairs = _resource_pairs(resources, "plan resources")
+    _check_resources(g, Dict(res_pairs), Symbol[])
+    res_idxs = Dict(name => _resource_idx(r) for (r, (name, _)) in enumerate(res_pairs))
+    built = BuiltJobGraph(_build(g, nworkers, res_idxs), nworkers, last.(res_pairs))
     if compile && nworkers > 1
         _compile!(built.root)
     end
@@ -627,6 +728,10 @@ mutable struct BuiltJobGraph
     const root::BuiltGraphNode
     const nworkers::Int
     const workers::Vector{WorkerState}
+    const capacity::Vector{Int64} # per resource, in the order given to plan
+    # The free amount of each resource, at a stride of one cache line, with a
+    # spare stride at each end as in BuiltGraphNode.states, see _resource_idx
+    const resources::AtomicMemory{Int64}
     # set by the worker that finishes the root graph, or errors; checked before starting a chunk
     @atomic exit::Bool
     const sleepers::Threads.Condition
@@ -635,14 +740,24 @@ mutable struct BuiltJobGraph
     # 16 lsb are a count of workers going to sleep or sleeping, 48 msb are the notify counter
     @atomic notify_sleeper::UInt64
     const _pad_after::typeof(CACHE_LINE_PAD)
-    function BuiltJobGraph(root::BuiltGraphNode, nworkers::Int)
+    function BuiltJobGraph(root::BuiltGraphNode, nworkers::Int, capacity::Vector{Int64})
         @assert nworkers > 0
         if isempty(root.children)
             nworkers = 0 # an empty graph has nothing to run, so no workers
         end
-        new(root, nworkers, [WorkerState(i, root) for i in 1:nworkers], false, Threads.Condition(), CACHE_LINE_PAD, UInt64(0), CACHE_LINE_PAD)
+        resources = AtomicMemory{Int64}(undef, JOB_STATE_STRIDE * (length(capacity) + 2))
+        for i in eachindex(resources)
+            @atomic :monotonic resources[i] = 0 # set to the capacities by run!
+        end
+        new(
+            root, nworkers, [WorkerState(i, root) for i in 1:nworkers], capacity, resources,
+            false, Threads.Condition(), CACHE_LINE_PAD, UInt64(0), CACHE_LINE_PAD,
+        )
     end
 end
+
+# Index of resource r, in 1:length(capacity), in BuiltJobGraph.resources.
+_resource_idx(r::Int) = r * JOB_STATE_STRIDE + 1
 
 function Base.show(io::IO, g::BuiltJobGraph)
     print(io, BuiltJobGraph, "(@", repr(objectid(g)), ", ", g.nworkers, " workers)")
@@ -653,7 +768,7 @@ end
 
 Run every chunk of every job as `job.fun(chunk_idx, info::WorkerInfo)` on
 `g.nworkers` workers, honoring the `skip_chunks`, and `repeat_if`
-predicates. No chunk
+predicates, and the jobs' resources. No chunk
 of a job starts until every chunk of each job it deps on, directly or
 transitively, has finished, so a chunk can read whatever those chunks produced
 without synchronizing in the `fun`s. A node that deps on a nested graph waits
@@ -689,6 +804,9 @@ function run!(g::BuiltJobGraph)
     @atomic :monotonic g.notify_sleeper = UInt64(0)
     for w in g.workers
         w.err = nothing
+    end
+    for (r, cap) in enumerate(g.capacity)
+        @atomic :monotonic g.resources[_resource_idx(r)] = cap # all free, even after an errored run
     end
     _activate!(g.root)
     @sync begin
@@ -837,10 +955,23 @@ function _scan!(g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode)
             if !(claimed < child.nchunks || claimed == CLAIM_READY)
                 continue
             end
+            # Take the job's resources, if any, for as long as this worker
+            # claims its chunks.
+            res = node.resources[i]
+            has_res = !isempty(res)
+            has_res && !_acquire!(g, res) && continue
             # try to do work on the job.
             # ndone is the number of chunks completed
             ndone = _claim!(child.fun, g, w, node, i, child.nchunks)
-            iszero(ndone) && continue
+            if iszero(ndone)
+                # found the job exhausted: put back the resources here, as
+                # _finish! would
+                if has_res
+                    _release!(g, res)
+                    _wake_sleeping!(g)
+                end
+                continue
+            end
             progress = true
             done = _finish!(g, w, node, i, ndone)
             done && return (progress=true, done=true)
@@ -926,6 +1057,49 @@ function _claim!(fun, g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode, i:
     ndone
 end
 
+# Return whether this worker took all of res, a job's resources as
+# (index, amount) pairs; if not it holds none of them.
+# All or nothing and without waiting, so a worker never waits holding
+# resources. The acquires pair with the releases of _release!, so a chunk sees
+# the writes of the chunks that held the resources before it, making a
+# resource of capacity 1 a lock.
+function _acquire!(g::BuiltJobGraph, res::Vector{Tuple{Int, Int64}})::Bool
+    free = g.resources
+    # Loads first, so workers scanning a blocked job neither write the
+    # resources' cache lines nor take some of them only to put them back.
+    for (r, amount) in res
+        (@inbounds @atomic :monotonic free[r]) < amount && return false
+    end
+    for k in eachindex(res)
+        (r, amount) = res[k]
+        x = @inbounds @atomic :monotonic free[r]
+        while true
+            if x < amount # taken since the loads: put back what this worker took
+                if k > firstindex(res)
+                    for (r2, amount2) in view(res, firstindex(res):k-1)
+                        @inbounds @atomic :release free[r2] += amount2
+                    end
+                    _wake_sleeping!(g) # like any release
+                end
+                return false
+            end
+            (; old, success) = @inbounds @atomicreplace :acquire :monotonic free[r] x => x - amount
+            success && break
+            x = old
+        end
+    end
+    true
+end
+
+# Put back res, a job's resources taken by _acquire!.
+# The caller must then wake the sleepers, which may have slept for want of them.
+function _release!(g::BuiltJobGraph, res::Vector{Tuple{Int, Int64}})
+    for (r, amount) in res
+        @inbounds @atomic :release g.resources[r] += amount
+    end
+    nothing
+end
+
 # Initialize the counters of node's children for a new activation and mark its
 # starts, the children with no deps, ready. Only the activating worker touches
 # the counters until then. Nested graphs are not activated here: a graph start
@@ -963,13 +1137,23 @@ function _publish!(node::BuiltGraphNode, i::Int)::Int
 end
 
 # Return whether graph node is done and not repeating.
-# May return false if another worker errored and set g.exit.
+# Finish n chunks of node's child i, putting back its resources, which this
+# worker holds, and waking the sleepers if it does, with the same RMW as for the
+# work it publishes. Its on_fin rev dep, if this readies it, is run here
+# holding the part of them it needs.
+# May return false if another worker errored and set g.exit, leaving the
+# resources held for run! to reset.
 function _finish!(g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode, i::Int, n::Int)::Bool
     states = node.states
     # Loop along the chain of on_fin jobs
     while true
         rev_deps = node.rev_deps[i]
         if isempty(rev_deps) # nothing depends on me
+            res = node.resources[i]
+            if !isempty(res)
+                _release!(g, res)
+                _wake_sleeping!(g)
+            end
             # check if this finishes the node
             # A negative count means a chunk was finished twice.
             left = @inbounds @atomic :acquire_release states[_done_idx()] -= n
@@ -1008,10 +1192,14 @@ function _finish!(g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode, i::Int
                 npublished += _publish!(node, r)
             end
         end
+        # Put back child i's resources, or with an on_fin job to run, the
+        # part of them it doesn't need.
+        put_back = iszero(on_fin) ? node.resources[i] : node.fin_release[i]
+        _release!(g, put_back)
         # This worker takes one chunk itself: the on_fin job, run below, or
         # else a published chunk in its scan. Wake before running the on_fin
         # job, so sleepers don't wait it out.
-        if npublished + !iszero(on_fin) > 1
+        if !isempty(put_back) || npublished + !iszero(on_fin) > 1
             _wake_sleeping!(g)
         end
         iszero(on_fin) && return false
@@ -1022,7 +1210,7 @@ function _finish!(g::BuiltJobGraph, w::WorkerState, node::BuiltGraphNode, i::Int
             (@atomic :monotonic g.exit) && return false
             (node.children[on_fin]::Job).fun(1, w.info)
         end
-        # now finish the on_fin job
+        # now finish the on_fin job, holding its resources
         i, n = on_fin, 1
     end
 end
