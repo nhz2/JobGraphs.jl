@@ -409,11 +409,11 @@ end
 # graph ran a multiple of its iterations per activation, then on NW workers
 # and on more workers than threads, checking they ran the same chunks with
 # the same predicate calls and iterations, in a valid order.
-function check_random_runs(rng, ntrials::Int, NW::Int)
+function check_random_runs(rng, ntrials::Int, NW::Int; static::Bool=false)
     for trial in 1:ntrials
         (g, ctx, info) = x_rand_graph(rng, 3)
         x_reset!(ctx, 1)
-        JobGraphs.run!(JobGraphs.plan(g, 1))
+        JobGraphs.run!(JobGraphs.plan(g, 1; static))
         @test x_ordered(info, ctx)
         @test all(iszero(ctx.iter[id] % info.nrepeat[id]) for id in eachindex(info.nrepeat))
         chunks = x_chunks(ctx)
@@ -421,7 +421,7 @@ function check_random_runs(rng, ntrials::Int, NW::Int)
         calls = copy(ctx.calls)
         for nw in (NW, 2 * Threads.nthreads() + 1)
             x_reset!(ctx, nw)
-            JobGraphs.run!(JobGraphs.plan(g, nw))
+            JobGraphs.run!(JobGraphs.plan(g, nw; static))
             @test x_chunks(ctx) == chunks
             @test ctx.iter == iter
             @test ctx.calls == calls
@@ -993,6 +993,102 @@ end
 
     @testset "random nested graphs" begin
         check_random_runs(Random.Xoshiro(0x2b1c), 100, NW)
+    end
+
+    @testset "static" begin
+        # Experimental: run! starts the workers with Threads.@threads :static,
+        # at most one per thread of the default pool, each staying on its
+        # thread for the whole run.
+        nthr = Threads.threadpoolsize()
+        ctx = RunCtx()
+        g = JobGraph([
+            :a => (;job=Job(RunFun(ctx, :a), 4)),
+            :b => (;job=Job(RunFun(ctx, :b), 1), deps=[:a]), # on_fin
+            :c => (;job=Job(RunFun(ctx, :c), 2), deps=[:b]),
+            :d => (;job=Job(RunFun(ctx, :d), 3)),
+        ])
+        @test !plan(g, NW).static
+        chunks = [(:a, 1), (:a, 2), (:a, 3), (:a, 4), (:b, 1), (:c, 1), (:c, 2), (:d, 1), (:d, 2), (:d, 3)]
+        @test run_chunks(ctx, plan(g, 1; static=true)) == chunks
+        for nw in (NW, 2 * nthr + 1)
+            b = plan(g, nw; static=true)
+            @test b.static
+            @test run_chunks(ctx, b) == chunks
+            @test run_before(ctx, [:a], [:b])
+            @test run_before(ctx, [:b], [:c])
+            @test run_chunks(ctx, b) == chunks # and again
+            @test all(e.worker ≤ min(nw, nthr) for e in ctx.events)
+        end
+
+        # Each worker's chunks see one thread id, even across waiting on
+        # spawned tasks, which without static usually resumes a worker on
+        # another thread, and no two workers share a thread.
+        nwmax = 2 * nthr + 1
+        tids = [Int[] for _ in 1:nwmax] # each worker pushes only to its own
+        tid_fun = function (chunk_idx, info)
+            push!(tids[info.worker_idx], Threads.threadid())
+            ts = [Threads.@spawn(sum(sin, 1:20_000)) for _ in 1:nthr]
+            foreach(wait, ts)
+            push!(tids[info.worker_idx], Threads.threadid())
+            nothing
+        end
+        g = JobGraph([:t => (;job=Job(tid_fun, 8 * nwmax))])
+        for nw in (NW, nwmax)
+            foreach(empty!, tids)
+            run!(plan(g, nw; static=true))
+            @test sum(length, tids) == 2 * 8 * nwmax
+            used = findall(!isempty, tids)
+            @test used ⊆ 1:min(nw, nthr)
+            @test all(allequal(tids[w]) for w in used)
+            @test allunique(first(tids[w]) for w in used)
+            @test all(Threads.threadpool(first(tids[w])) == :default for w in used)
+        end
+
+        # sleeping workers wake for published chunks
+        g = JobGraph([
+            :a => (;job=Job(SlowFun(RunFun(ctx, :a), 0.05), 1)),
+            :b => (;job=Job(SlowFun(RunFun(ctx, :b), 0.01), 4 * NW), deps=[:a]),
+        ])
+        b = plan(g, NW; static=true)
+        @test run_chunks(ctx, b) == [(:a, 1); [(:b, i) for i in 1:4 * NW]]
+        @test iszero((@atomic b.notify_sleeper) % UInt16)
+        nthr > 1 && @test length(unique(e.worker for e in ctx.events if e.id == :b)) > 1
+
+        # resources
+        nbumps = Ref(0)
+        bump = Job(1000; resources=(;lock=1)) do chunk_idx, info
+            nbumps[] += 1
+            nothing
+        end
+        b = plan(JobGraph([:a => (;job=bump), :b => (;job=bump), :c => (;job=bump)]), NW; resources=(;lock=1), static=true)
+        for _ in 1:10
+            nbumps[] = 0
+            run!(b)
+            @test nbumps[] == 3000
+        end
+
+        # errors are collected as without static, and the plan runs again
+        flag = Ref(true)
+        g = JobGraph([
+            :a => (;job=Job((chunk_idx, info) -> (flag[] && error("once"); nothing), 2)),
+            :b => (;job=Job(RunFun(ctx, :b), 2), deps=[:a]),
+        ])
+        b = plan(g, NW; static=true)
+        e = run_error(ctx, b)
+        @test e isa JobGraphs.JobGraphError
+        @test all(occursin(r"^in job a chunk [12]$", w) for w in error_wheres(e))
+        flag[] = false
+        @test run_chunks(ctx, b) == [(:b, 1), (:b, 2)]
+
+        # @threads :static can't nest, so neither can a static run!
+        inner = plan(JobGraph([:x => (;job=Job(job_fun_a, 2))]), NW; static=true)
+        g = JobGraph([:a => (;job=Job((chunk_idx, info) -> run!(inner), 1))])
+        e = run_error(ctx, plan(g, NW; static=true))
+        @test e isa JobGraphs.JobGraphError
+        @test error_wheres(e) == ["in job a chunk 1"]
+        @test only(e.worker_errors).err.ex == ErrorException("`@threads :static` cannot be used concurrently or nested")
+
+        check_random_runs(Random.Xoshiro(0x57a7), 30, NW; static=true)
     end
 end
 nothing

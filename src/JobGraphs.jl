@@ -577,8 +577,19 @@ lookup of about a microsecond per job once they are compiled, so pass
 `compile=false` when planning often.
 
 The returned object cannot be `run!` concurrently.
+
+# Extended help
+
+## Advanced keyword arguments
+
+- `static::Bool=false`: This option is experimental and should normally be
+  avoided. Carefully read the extended help of `Threads.@threads` before
+  using this. If `true` then `run!` will start at most
+  `Threads.threadpoolsize()` workers with `Threads.@threads :static` so each
+  worker has a fixed thread id. Pinning those threads with
+  ThreadPinning.jl then confines the workers to chosen cpus.
 """
-function plan(g::JobGraph, nworkers::Int; compile::Bool=true, resources=(;))
+function plan(g::JobGraph, nworkers::Int; compile::Bool=true, resources=(;), static::Bool=false)
     if nworkers ≤ 0
         throw(ArgumentError("nworkers must be positive"))
     end
@@ -588,7 +599,7 @@ function plan(g::JobGraph, nworkers::Int; compile::Bool=true, resources=(;))
     res_pairs = _resource_pairs(resources, "plan resources")
     _check_resources(g, Dict(res_pairs), Symbol[])
     res_idxs = Dict(name => _resource_idx(r) for (r, (name, _)) in enumerate(res_pairs))
-    built = BuiltJobGraph(_build(g, nworkers, res_idxs), nworkers, last.(res_pairs))
+    built = BuiltJobGraph(_build(g, nworkers, res_idxs), nworkers, last.(res_pairs), static)
     if compile && nworkers > 1
         _compile!(built.root)
     end
@@ -731,6 +742,7 @@ mutable struct BuiltJobGraph
     const nworkers::Int
     const workers::Vector{WorkerState}
     const capacity::Vector{Int64} # per resource, in the order given to plan
+    const static::Bool # If true use Threads.@threads :static so each worker has a fixed thread id.
     # The free amount of each resource, at a stride of one cache line, with a
     # spare stride at each end as in BuiltGraphNode.states, see _resource_idx
     const resources::AtomicMemory{Int64}
@@ -742,7 +754,7 @@ mutable struct BuiltJobGraph
     # 16 lsb are a count of workers going to sleep or sleeping, 48 msb are the notify counter
     @atomic notify_sleeper::UInt64
     const _pad_after::typeof(CACHE_LINE_PAD)
-    function BuiltJobGraph(root::BuiltGraphNode, nworkers::Int, capacity::Vector{Int64})
+    function BuiltJobGraph(root::BuiltGraphNode, nworkers::Int, capacity::Vector{Int64}, static::Bool)
         @assert nworkers > 0
         if isempty(root.children)
             nworkers = 0 # an empty graph has nothing to run, so no workers
@@ -752,7 +764,7 @@ mutable struct BuiltJobGraph
             @atomic :monotonic resources[i] = 0 # set to the capacities by run!
         end
         new(
-            root, nworkers, [WorkerState(i, root) for i in 1:nworkers], capacity, resources,
+            root, nworkers, [WorkerState(i, root) for i in 1:nworkers], capacity, static, resources,
             false, Threads.Condition(), CACHE_LINE_PAD, UInt64(0), CACHE_LINE_PAD,
         )
     end
@@ -811,9 +823,17 @@ function run!(g::BuiltJobGraph)
         @atomic :monotonic g.resources[_resource_idx(r)] = cap # all free, even after an errored run
     end
     _activate!(g.root)
-    @sync begin
-        for w in g.workers
-            Threads.@spawn _run_worker(g, $w)
+    if !g.static
+        @sync begin
+            for w in g.workers
+                Threads.@spawn _run_worker(g, $w)
+            end
+        end
+    else
+        # We cannot have more workers than threads with static
+        nworkers = min(g.nworkers, Threads.threadpoolsize())
+        Threads.@threads :static for i in 1:nworkers
+            _run_worker(g, g.workers[i])
         end
     end
     errs = JobGraphWorkerError[w.err for w in g.workers if !isnothing(w.err)]
