@@ -11,19 +11,9 @@ A job starts as soon as the jobs it depends on finish, and independent jobs over
 It works best for programs whose schedule is mostly the same on every run, such as the
 inner loop of a simulation or solver.
 
-## Installation
-
-The package is not registered yet. It requires Julia 1.12 or later.
-
-```julia
-using Pkg
-Pkg.add(url="https://github.com/nhz2/JobGraphs.jl")
-```
-
-Start Julia with several threads, for example `julia --threads=auto`. Otherwise
-there is only one worker.
-
 ## Quick start
+
+Start Julia with several threads, for example `julia --threads=auto`.
 
 This example also uses [ChunkSplitters.jl](https://github.com/JuliaFolds2/ChunkSplitters.jl)
 to split the input into chunks.
